@@ -1,0 +1,6 @@
+**/data/
+**/*.npz
+**/__pycache__/
+**/*.pt
+**tensorboard/
+**/*.log
