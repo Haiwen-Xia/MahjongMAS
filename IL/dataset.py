@@ -5,7 +5,7 @@ import glob
 import random
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-
+#* key padding mask 由false到true
 class MahjongDataset(Dataset):
     """
     麻将数据集，用于加载预处理后的麻将对局数据
