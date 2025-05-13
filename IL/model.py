@@ -103,6 +103,7 @@ class TimeNet(nn.Module):
         drop = args.get("dropout", 0.1)
         device = args.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         # 1. embedding + position
+        feature_sep_idx = [0,4,15,50] # 85维向量的分拆,每一个存初始点
         self.embed = nn.Sequential( #* 可能需要特殊初始化
             nn.Linear(history_feature_dim, 4* self.hid),
             nn.ReLU(),
