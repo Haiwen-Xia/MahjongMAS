@@ -31,6 +31,8 @@ class ModelPoolServer:
         self.n += 1
         self.shared_model_list[-1] = self.n
         metadata['memory'] = memory
+        
+        return metadata
 
 class ModelPoolClient:
     

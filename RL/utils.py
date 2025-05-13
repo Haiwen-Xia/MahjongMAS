@@ -103,7 +103,7 @@ def setup_process_logging_and_tensorboard(base_log_dir, run_name, process_name, 
     try:
         file_handler = logging.FileHandler(log_file_path, mode='w') # 'w' to overwrite for this specific process log
         formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - [%(processName)s:%(process)d] - %(levelname)s - %(message)s'
+            '%(asctime)s [%(processName)s/%(levelname)s] %(message)s'
         )
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)

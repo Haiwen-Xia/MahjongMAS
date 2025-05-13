@@ -348,7 +348,9 @@ class FeatureAgent(MahjongGBAgent):
                 if self._check_mahjong(self.curTile):
                     self.valid.append(self.OFFSET_ACT['Hu'])
 
-                # 检查是否是最后一张牌, 如果有, 此时有 [海底捞月], 哪怕本身到不了 8 番, 也可以胡牌 (四个顺子 + 一对)
+                # 检查是否是最后一张牌, 如果是最后一张牌, 意味着不成功便成仁, 这张弃牌要么能让自己胡牌 (刚才考虑了), 要么胡不了, 就只考虑 PASS
+
+                # 如果不是最后一张牌, 那么我们还有一些余地, 考虑其他的操作
                 if not self.wallLast:
 
                     # 检查碰和杠的可能性

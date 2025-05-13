@@ -144,8 +144,7 @@ class Actor(Process):
             # 初始化用于存储当前 episode 数据的字典
             episode_data = {agent_name: {
                 'state' : {'observation': [], 'action_mask': []},
-                'action' : [], 'reward' : [], 'value' : [],
-                # 'log_prob' : [] # PPO 需要记录 log_prob
+                'action' : [], 'reward' : [], 'value' : [], 'log_prob' : []
             } for agent_name in env.agent_names}
             # 存储每个智能体的总原始奖励
             episode_raw_rewards = {agent_name: 0.0 for agent_name in env.agent_names}
@@ -190,20 +189,23 @@ class Actor(Process):
                         with torch.no_grad():
                             logits, value = model(model_input) # 获取动作 logits 和状态价值 V(s)
                             action_dist = torch.distributions.Categorical(logits=logits)
-                            action = action_dist.sample().item() # 采样动作
+
+                            action_tensor = action_dist.sample() # Sample action as a tensor
+                            action_item = action_tensor.item()   # Get Python number for env
+                            log_prob_item = action_dist.log_prob(action_tensor).item()
+
                             value = value.item() # 获取价值
-                            # log_prob = action_dist.log_prob(torch.tensor(action)).item() # 计算并记录 log_prob (PPO需要)
                     except Exception as e:
                          self.logger.error(f"Error during model inference for {agent_name} at step {step_count}: {e}. Skipping episode.")
                          done = True
                          break
 
                     # 存储选择的动作、价值（和 log_prob）
-                    actions[agent_name] = action
+                    actions[agent_name] = action_item
                     values[agent_name] = value
                     agent_data['action'].append(actions[agent_name])
                     agent_data['value'].append(values[agent_name])
-                    # agent_data['log_prob'].append(log_prob) # PPO 需要存储
+                    agent_data['log_prob'].append(log_prob_item)
 
                 if done: break # 如果在动作选择中出错，跳出 while 循环
 
@@ -247,10 +249,12 @@ class Actor(Process):
 
             # --- Episode 结束 ---
             episode_duration = time.time() - episode_start_time
-            # 计算所有 agent 的平均奖励 (或其他你关心的聚合奖励)
+
+            # TODO: average reward 在麻将中没有意义, 因为这是零和的
             avg_episode_reward = sum(episode_raw_rewards.values()) / len(env.agent_names) if env.agent_names else 0
             self.logger.info(f"Episode {episode+1} finished in {step_count} steps ({episode_duration:.2f}s). "
                         f"Model Version {model_version_id}. Avg Raw Reward: {avg_episode_reward:.2f}.")
+            
             
             # --- 记录到 TensorBoard ---
             if self.writer:
@@ -283,10 +287,11 @@ class Actor(Process):
                         values = np.array(agent_data['value'][:T], dtype=np.float32)
                         next_values = np.array(agent_data['value'][1:], dtype=np.float32)
                     elif len(agent_data['value']) == T:
+                        # 依照惯例, 最后第 T 时间步的 value 为 0
                         values = np.array(agent_data['value'], dtype=np.float32)
                         next_values = np.zeros_like(values)
                         if T > 1: next_values[:-1] = values[1:]
-                        self.logger.warning(f"Value list length ({len(agent_data['value'])}) equals action length ({T}). Assuming V(s_T)=0 for {agent_name}.")
+                        # self.logger.warning(f"Value list length ({len(agent_data['value'])}) equals action length ({T}). Assuming V(s_T)=0 for {agent_name}.")
                     else:
                          self.logger.error(f"Value list length mismatch for {agent_name}. Skipping GAE.")
                          continue
@@ -295,7 +300,7 @@ class Actor(Process):
                     mask = np.stack(agent_data['state']['action_mask'][:T])
                     actions = np.array(agent_data['action'], dtype=np.int64)
                     rewards = np.array(agent_data['reward'][:T], dtype=np.float32)
-                    # log_probs_np = np.array(agent_data['log_prob'], dtype=np.float32) # PPO 需要
+                    log_probs_np = np.array(agent_data['log_prob'], dtype=np.float32) # PPO 需要
 
                     # --- GAE 计算 (同前一版本) ---
                     gamma = self.config.get('gamma', 0.99)
@@ -303,6 +308,7 @@ class Actor(Process):
                     td_target = rewards + gamma * next_values
                     td_delta = td_target - values
                     advantages = np.zeros_like(rewards)
+                    
                     adv = 0.0
                     for t in reversed(range(T)):
                         adv = td_delta[t] + gamma * lambda_gae * adv
@@ -322,8 +328,8 @@ class Actor(Process):
                         },
                         'action': actions,       # (T,)
                         'adv': advantages,     # (T,) GAE 优势值
-                        'target': td_target    # (T,) TD 目标价值 (或称为 Return)
-                        # 'log_prob': log_probs_np # PPO 需要
+                        'target': td_target,    # (T,) TD 目标价值 (或称为 Return)
+                        'log_prob': log_probs_np # PPO 需要
                     }
                     self.replay_buffer.push(data_to_push)
                     # logger.debug(f"Pushed {T} steps of data for {agent_name} to replay buffer.") # Debug level log
