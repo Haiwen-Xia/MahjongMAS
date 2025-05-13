@@ -4,3 +4,5 @@
 **/*.pt
 **tensorboard/
 **/*.log
+**/model/
+**/RL/log
