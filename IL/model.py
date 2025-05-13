@@ -103,7 +103,7 @@ class TimeNet(nn.Module):
         drop = args.get("dropout", 0.1)
         device = args.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         # 1. embedding + position
-        self.embed = nn.Sequential(
+        self.embed = nn.Sequential( #* 可能需要特殊初始化
             nn.Linear(history_feature_dim, 4* self.hid),
             nn.ReLU(),
             nn.Linear(4* self.hid, self.hid),
@@ -135,8 +135,9 @@ class TimeNet(nn.Module):
             nn.Linear(self.hid // 2, output_dim),
         )
 
+        self._init_transformer_weights()
     # ---------- forward ----------
-    def forward(self, batch, hist_kpm:torch.Tensor=None):
+    def forward(self, batch, hist_kpm:torch.Tensor):
         # ---- ① 历史序列 ----
         hist = self.embed(batch["history"])                   # (B,T,D)
         hist = hist + self.pos_enc(hist)                      # Pos‑enc
@@ -150,7 +151,6 @@ class TimeNet(nn.Module):
         
         mask_0 = torch.tensor([False] * hist.shape[0], dtype=torch.bool, device=hist.device).unsqueeze(1)  # (B,1)
         joint_kpm = torch.cat([mask_0, hist_kpm], dim=1) if hist_kpm is not None else None  # (B, T+1); if 语句缓解pylance报错
-        
         joint = self.joint_transformer(joint,joint_kpm)
         state, hist = joint[:,0,:].unsqueeze(1), joint[:,1:,:]
         state = self.state2hist(state, k=hist,  v=hist, key_padding_mask=hist_kpm)       # Q=state
@@ -159,6 +159,18 @@ class TimeNet(nn.Module):
         logits = self.fc(state.squeeze(1))                    # (B,|A|)
         inf_mask = torch.clamp(torch.log(batch["action_mask"]), -1e38, 1e38)
         return logits + inf_mask
+    
+    def _init_transformer_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=m.embedding_dim ** -0.5)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)    
 if __name__ == "__main__":
     # 测试代码
     model = TimeNet(95, (4, 4, 9), 235)

@@ -6,7 +6,7 @@ import random
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 #* key padding mask 由false到true
-class MahjongDataset(Dataset):
+class TimeMajongDataset(Dataset):
     """
     麻将数据集，用于加载预处理后的麻将对局数据
     """
@@ -54,7 +54,7 @@ class MahjongDataset(Dataset):
             
             for i in range(len(act)):
                 self.data.append({
-                    'history': history[i],
+                    'history': history[:i+1],
                     'hand': hand[i],
                     'action_mask': mask[i],
                     'action': act[i]
@@ -73,9 +73,11 @@ class MahjongDataset(Dataset):
             torch.FloatTensor(sample['action_mask']),
             torch.LongTensor([sample['action']])
         )
+    def get_sample_length(self, idx):
+        """仅返回样本历史序列的长度，而不加载完整数据"""
+        return len(self.data[idx]['history'])
 
-
-def create_bucket_sampler(dataset, bucket_sizes, batch_size, shuffle=True):
+def create_bucket_sampler(dataset:TimeMajongDataset, bucket_sizes, batch_size, shuffle=True):
     """
     创建基于bucket的采样器
     
@@ -88,8 +90,11 @@ def create_bucket_sampler(dataset, bucket_sizes, batch_size, shuffle=True):
     Returns:
         BucketSampler对象
     """
-    # 计算每个样本的长度（这里假设是观察向量的长度）
-    lengths = [len(sample[0]) for sample in dataset]
+    lengths = []
+    for idx in range(len(dataset)):
+        # 只获取history长度，不加载完整数据
+        sample = dataset.get_sample_length(idx)  # 需要添加此方法到数据集类
+        lengths.append(sample)
     
     # 创建buckets
     buckets = [[] for _ in bucket_sizes]
@@ -99,13 +104,12 @@ def create_bucket_sampler(dataset, bucket_sizes, batch_size, shuffle=True):
                 buckets[i].append(idx)
                 break
     
-    # 创建并返回BucketSampler
     return BucketSampler(buckets, batch_size, shuffle)
 
 
 class BucketSampler(torch.utils.data.Sampler):
     """
-    基于bucket的采样器，将相似长度的序列放在一起，减少填充
+    基于bucket的采样器，将相似长度的序列放在一起，减少填充,目的就是返回每次采样需要的下标
     """
     def __init__(self, buckets, batch_size, shuffle=True):
         self.buckets = buckets
@@ -117,10 +121,21 @@ class BucketSampler(torch.utils.data.Sampler):
     def create_indices(self):
         self.indices = []
         for bucket in self.buckets:
+            # Skip empty buckets
+            if not bucket:
+                continue
+                
             if self.shuffle:
                 random.shuffle(bucket)
+                
+            # Create batches from the bucket
             for i in range(0, len(bucket), self.batch_size):
-                self.indices.append(bucket[i:i+self.batch_size])
+                batch = bucket[i:i+self.batch_size]
+                # Only add batches with at least one sample
+                if batch:
+                    self.indices.append(batch)
+                    
+        # Shuffle the batches if needed
         if self.shuffle:
             random.shuffle(self.indices)
     
@@ -135,25 +150,34 @@ class BucketSampler(torch.utils.data.Sampler):
 
 def collate_fn(batch):
     """
-    将一个batch的样本填充到相同长度
-    
-    Args:
-        batch: 一个batch的样本列表
-    
-    Returns:
-        填充后的张量
+    将一个batch的样本填充到相同长度，并返回符合模型要求的字典格式
     """
-    observations, action_masks, actions = zip(*batch)
+    histories, hands, action_masks, actions = zip(*batch)
     
-    # 填充观察向量到相同长度
-    observations_padded = pad_sequence(observations, batch_first=True)
-    action_masks_padded = pad_sequence(action_masks, batch_first=True)
+    # 填充history到相同长度
+    histories_padded = pad_sequence(histories, batch_first=True)
+    
+    # 创建padding mask (True表示要mask的位置)
+    lengths = [len(h) for h in histories]
+    max_len = max(lengths)
+    pad_mask = torch.zeros(len(histories), max_len, dtype=torch.bool)
+    for i, length in enumerate(lengths):
+        pad_mask[i, length:] = True
+    
+    # 不需要pad的tensors
+    hands = torch.stack(hands)
+    action_masks = torch.stack(action_masks)
     actions = torch.cat(actions)
     
-    return observations_padded, action_masks_padded, actions
+    return {
+        "history": histories_padded,
+        "hand": hands,
+        "action_mask": action_masks,
+        "action": actions,
+        "pad_mask": pad_mask
+    }
 
-
-def get_mahjong_dataloader(data_dir, batch_size=32, split='train', shuffle=True):
+def get_mahjong_dataloader(data_dir, batch_size=32, split='train', shuffle=True, bucket_sizes=[20 * i for i in range(1,21)]):
     """
     创建麻将数据加载器
     
@@ -167,13 +191,11 @@ def get_mahjong_dataloader(data_dir, batch_size=32, split='train', shuffle=True)
         DataLoader对象
     """
     # 创建数据集
-    dataset = MahjongDataset(data_dir, split=split)
+    dataset = TimeMajongDataset(data_dir, split=split)
     
     # 根据新的特征设计调整bucket大小
     # 基础特征为6维，历史特征为95维，总共101维
-    # 每个bucket的大小应该根据实际数据分布设置
-    bucket_sizes = [101, 102, 103, 104, 105, 106, 107, 108, 
-                   110, 115, 120, 125, 130, 140, 150, 160]
+
     
     # 创建bucket采样器
     sampler = create_bucket_sampler(dataset, bucket_sizes, batch_size, shuffle)
