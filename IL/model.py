@@ -145,7 +145,7 @@ class TimeNet(nn.Module):
         hist = self.transformer(hist, key_padding_mask=hist_kpm)
 
         # ---- ② 当前手牌 ----
-        state = self.state_extractor(batch["hand"])           # (B,D)
+        state = self.state_extractor(batch["global_state"])           # (B,D)
         state = state.unsqueeze(1)                            # ‑> (B,1,D)
         # ---- joint attention  ----
         joint = torch.cat([hist, state], dim=1)                # (B,T+1,D)
@@ -188,7 +188,7 @@ if __name__ == "__main__":
     #print(seq_lengths,mask)
     x = {
         "history": torch.randn(32, max_seq_len, 95,device="cuda"),
-        "hand": torch.randn(32, 4, 4, 9,device="cuda"),
+        "global_state": torch.randn(32, 4, 4, 9,device="cuda"),
         "action_mask": torch.ones(32, 235,device="cuda"),
     }
     output = model(x,mask)

@@ -6,7 +6,7 @@ try:
     from MahjongGB import MahjongFanCalculator
 except:
     print('MahjongGB library required! Please visit https://github.com/ailab-pku/PyMahjongGB for more information.')
-    raise
+   # raise
 
 # FeatureAgent 的定位是什么样的?
 
@@ -22,10 +22,10 @@ except:
 
 class FeatureAgentTimeSeries(MahjongGBAgent):
 
-    # 每一次获取的事件为一个大小为 85 的向量.
-    EVENT_SIZE = 85
+    # 每一次获取的事件为一个大小为 83 的向量.
+    EVENT_SIZE = 83
 
-    GLOBAL_CHANNAL = 14 
+    GLOBAL_CHANNAL = 14
 
     GLOBAL_OFFSET = {
         'SEAT_WIND' : 0,        # 座风      通道 0
@@ -75,7 +75,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
 
     # 1. 执行动作的玩家: 4 维 one-hot 向量
     
-    # 2. 动作类型向量部分: 11 维 one-hot 向量
+    # 2. 动作类型向量部分: 9 维 one-hot 向量
     ACTION_TYPES_DEF = {
         'DRAW_TILE': 0,
         'PLAY_TILE': 1,
@@ -84,10 +84,8 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
         'GANG': 4,
         'BUGANG': 5,
         'ANGANG': 6,
-        'UNCHI': 7,
-        'UNPENG': 8,
-        'WIN': 9,
-        'NO_ACTION': 10
+        'WIN': 7,
+        'NO_ACTION': 8
     }
     NUM_ACTION_TYPES = 11
 
@@ -138,13 +136,13 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
         self.valid = []
         self.curTile = None
         self.tileFrom = -1
+        self.event_pool = []
 
         self.global_obs = np.zeros((self.GLOBAL_CHANNAL, 36), dtype=np.float32)
 
         # 更新座风信息
-        self.global_obs[self.GLOBAL_OFFSET['SEAT_WIND']][self.OFFSET_TILE['F%d' % (self.seatWind + 1)]] = 1
+        self.global_obs[self.GLOBAL_OFFSET['SEAT_WIND']][self.OFFSET_TILE['F%d' % (self.seatWind + 1)]] = 1 #* 在风牌的位置放一个1
 
-        self.joint_history = []
 
     def _reset_current_event_info(self):
         """Resets event-specific information at the start of each request processing."""
@@ -191,7 +189,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             # 存储当前场风
             self.prevalentWind = int(t[1])
             # 更新场风信息
-            self.obs[self.OFFSET_OBS['PREVALENT_WIND']][self.OFFSET_TILE['F%d' % (self.prevalentWind + 1)]] = 1
+            self.global_obs[self.GLOBAL_OFFSET['PREVALENT_WIND']][self.OFFSET_TILE['F%d' % (self.prevalentWind + 1)]] = 1
             
             return
 
@@ -251,7 +249,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             self.current_event_player_relative = 0
             self.current_event_action_type_idx = self.ACTION_TYPES_DEF['DRAW_TILE']
             self.current_event_card1_str = tile
-
+            self.append_event()
             # 因为摸牌后我们一定需要执行某个操作, 所以我们需要返回一个 obs
             return self._obs()
 
@@ -280,8 +278,9 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             self.current_event_action_type_idx = self.ACTION_TYPES_DEF['DRAW_TILE']
 
 
-            # TODO: 这里把其他人摸了牌告诉模型 (虽然我们不知道摸了什么牌), 对于序列式模型来说
-            return self._obs()
+            # TODO: 这里把其他人摸了牌的事件存入 event_list
+            self.append_event()
+            return
 
         # Player N Invalid
         if event_str == 'Invalid': 
@@ -291,6 +290,9 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             self.current_event_action_type_idx = self.ACTION_TYPES_DEF['NO_ACTION']
             # 初始置空可用操作空间
             self.valid = []
+
+            # TODO: 这里把其他人无效的事件存入 event_list
+            self.append_event()
             return self._obs()
         
         # Player N Hu
@@ -304,6 +306,9 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
 
             # 初始置空可用操作空间
             self.valid = []
+
+            # TODO: 这里把其他人胡牌的事件存入 event_list
+           # self.append_event() #! Xia modify
             return self._obs()
         
         # Player N Play XX [其他玩家弃牌了]
@@ -324,10 +329,15 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             self.current_event_action_type_idx = self.ACTION_TYPES_DEF['PLAY_TILE']
             self.current_event_card1_str = self.curTile
 
+            # TODO: 这里把其他人打出的牌的事件存入 event_list
+            self.append_event()
+
             # 如果是自己打出的牌, 那么什么也不用做
             if p_rel == 0:
                 # 从手牌中移除打出的牌，更新手牌
                 if self.curTile in self.hand: self.hand.remove(self.curTile)
+                # self.append_event()
+                return 
             
             # 如果是别人打出了某张牌, 那么就需要我们考虑 吃/碰/杠/胡/过 等操作
             else:
@@ -372,8 +382,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
                 # 添加 Pass 动作
                 self.valid.append(self.OFFSET_ACT['Pass'])
 
-            # TODO: 无论是谁弃牌, 都要记下来
-            return self._obs()
+                return self._obs()
             
         # Player N Chi XX
         if event_str == 'Chi':
@@ -381,7 +390,8 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             玩家 p 吃牌 XX
             """
             # 这是顺子的 **中心牌**, 未必是被吃的牌
-            middle_tile_chi = t[3]
+            # middle_tile_chi is string
+            middle_tile_chi = t[3] 
             color = middle_tile_chi[0]
             # 这是中心牌的序号 (例如顺子 W4, W5, W6 中的 W5)
             num = int(middle_tile_chi[1])
@@ -391,9 +401,12 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             self.current_event_card1_str = middle_tile_chi
             self.current_event_card2_str = eaten_tile # Eaten tile is secondary info for Chi event
 
+            # TODO: 这里把其他人吃牌的事件存入 event_list
+            self.append_event()
+
             # 这里的 middle_tile_chi[1] 存储了被吃的牌的序号 (例如被吃的是 W6, 形成顺子 W4, W5, W6)
             # 这里记录的第一个是 行为, 第二个是 中心牌, 第三个是被吃的牌在顺子中的位置, i = 1, 2, 3
-            self.packs[p_rel].append(('CHI', tile, int(middle_tile_chi[1]) - num + 2))
+            self.packs[p_rel].append(('CHI', num, int(middle_tile_chi[1]) - num + 2))
 
             # 之前我们在弃牌的时候将 self.shownTiles[self.curTile] + 1, 意思是弃牌堆中某种牌的数量 + 1
             # 但是现在它落到了玩家 p 的手牌中, 变成了不可见的, 所以我们要将它 -1
@@ -419,8 +432,10 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
                 for tile in set(self.hand):
                     self.valid.append(self.OFFSET_ACT['Play'] + self.OFFSET_TILE[tile])
 
-            # TODO: 其他人吃了这件事也要告诉模型
-            return self._obs()
+                return self._obs()
+
+            else:
+                return 
             
         # Player N UnChi XX
         # 这仅仅发生在自己先假设自己吃了牌, 但是最终平台告诉你吃牌失败了 (因为杠/碰/胡优先级更高)
@@ -428,9 +443,6 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             """
             玩家 p 取消吃牌 XX
             """
-            self.current_event_action_type_idx = self.ACTION_TYPES_DEF['UNCHI']
-            self.current_event_card1_str = t[3]
-            self.current_event_card2_str = self.curTile
 
             # 获取取消吃的牌
             tile = t[3]
@@ -447,9 +459,8 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
                 for i in range(-1, 2):
                     self.hand.append(color + str(num + i))
                 self.hand.remove(self.curTile)
-            
-            # TODO: 需要返回 Unchi 这件事
-            return self._obs()
+
+            return 
 
         # Player N Peng
         if event_str == 'Peng':
@@ -459,6 +470,9 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             peng_tile = self.curTile # Tile being Peng-ed (set by previous Play event)
             self.current_event_action_type_idx = self.ACTION_TYPES_DEF['PENG']
             self.current_event_card1_str = peng_tile
+
+            # TODO: 这里把其他人碰牌的事件存入 event_list
+            self.append_event()
 
             # 更新碰牌的记录
             # 这里第一个是 行为, 第二个是 碰牌, 第三个则是相对于碰牌者的相对位置, 上家是 1, 对家是 2, 下家是 3
@@ -478,17 +492,16 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
 
                 for tile in set(self.hand):
                     self.valid.append(self.OFFSET_ACT['Play'] + self.OFFSET_TILE[tile])
-
-            # TODO: 这里其他人做的事情也改为需要返回观测
-            return self._obs()
+                
+                return self._obs()
+            else:
+                return 
 
         # Player N UnPeng
         if event_str == 'UnPeng':
             """
             玩家 p 取消碰牌
             """
-            self.current_event_action_type_idx = self.ACTION_TYPES_DEF['UNPENG']
-            peng_tile_original = self.curTile # Should be the tile that was Peng-ed
 
             # 更新取消碰牌的记录
             self.packs[p_rel].pop()
@@ -497,8 +510,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
                 for i in range(2):
                     self.hand.append(self.curTile)
 
-            # TODO: 自己撤销碰牌, 也需要返回
-            return self._obs()
+            return 
         
         if event_str == 'Gang':
             """
@@ -507,6 +519,9 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             # Modify:
             self.current_event_action_type_idx = self.ACTION_TYPES_DEF['GANG']
             self.current_event_card1_str = self.curTile
+
+            # TODO: 这里把其他人杠牌的事件存入 event_list
+            self.append_event()
 
             # 更新杠牌的记录
             # 和碰差不多, 上家是 1, 对家是 2, 下家是 3
@@ -519,8 +534,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
                     self.hand.remove(self.curTile)
                 self.isAboutKong = True
 
-            # TODO: 记录某个玩家杠了这件事
-            return self._obs()
+            return 
         
         # Player N AnGang XX
         if event_str == "AnGang":
@@ -528,6 +542,9 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             玩家 p 暗杠 XX
             """
             self.current_event_action_type_idx = self.ACTION_TYPES_DEF['ANGANG']
+
+            # TODO: 这里把其他人暗杠的事件存入 event_list
+            self.append_event()
 
             # 如果是自己暗杠, 才知道是什么牌
             # 如果其他人暗杠了, 那么我们只知道是暗杠, 但是不知道是什么牌
@@ -546,8 +563,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
                 self.isAboutKong = False
                 self.current_event_card1_str = self.NONE_TILE_STR
 
-            # TODO: 记录某个玩家暗杠了这个事情
-            return self._obs()
+            return 
 
         # Player N BuGang XX
         if event_str == 'BuGang':
@@ -557,6 +573,9 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             # 更新补杠的记录
             self.current_event_action_type_idx = self.ACTION_TYPES_DEF['BUGANG']
             self.current_event_card1_str = self.curTile
+
+            # TODO: 这里把其他人补杠的事件存入 event_list
+            self.append_event()
 
             tile = t[3]
             for i in range(len(self.packs[p_rel])):
@@ -571,8 +590,8 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
 
             if p_rel == 0:
                 self.hand.remove(tile)
-
                 self.isAboutKong = True
+                return 
 
             else:
                 # 考虑补杠胡
@@ -582,8 +601,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
                     self.valid.append(self.OFFSET_ACT['Hu'])
                 self.valid.append(self.OFFSET_ACT['Pass'])
 
-            # TODO: 自己补杠了, 也需要返回
-            return self._obs()
+                return self._obs()
 
         # 其余的情况都是非法的
         raise NotImplementedError('Unknown request %s!' % request)
@@ -667,7 +685,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             # 等价于 self.obs[2:2+d[tile]]
             # 所以这里可以看出来，后面四个维度实际记录的是你拥有几张牌的信息，拥有 3 张牌则 self.obs[2:5] 都是 1
             # 也就是拥有几张就顺序记录几个维度 
-            self.hand[self.GLOBAL_OFFSET['HAND'] : self.GLOBAL_OFFSET['HAND'] + d[tile], self.OFFSET_TILE[tile]] = 1
+            self.global_obs[self.GLOBAL_OFFSET['HAND'] : self.GLOBAL_OFFSET['HAND'] + d[tile], self.OFFSET_TILE[tile]] = 1
 
     def _shown_tiles_embedding_update(self):
         d = defaultdict(int) # 表示展示出来的牌的数量，默认值为 0
@@ -682,16 +700,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             # 整个通道设置为剩余牌数
             self.global_obs[self.GLOBAL_OFFSET['REMAIN%d' % p]] = self.tileWall[p] 
 
-    def _obs(self):
-        """
-        生成当前观测信息，以及可执行动作的掩码
-        """
-
-        # 更新全局信息
-        self._hand_embedding_update()
-        self._shown_tiles_embedding_update()
-        self._remains_embedding_update()
-
+    def append_event(self):
         # 更新事件信息
         # 1. Acting Player (4 bits one-hot, or all zeros if system/no specific player)
         player_vec = np.zeros(4)
@@ -719,6 +728,23 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             player_vec, action_type_vec, card1_vec, card2_vec
         ])
 
+        # 5. Event Pool (NUM_EVENT_POOL bits one-hot)
+        self.event_pool.append(event_vec)
+
+    def _obs(self):
+        """
+        生成当前观测信息，以及可执行动作的掩码
+        """
+
+        # 更新全局信息
+        self._hand_embedding_update()
+        self._shown_tiles_embedding_update()
+        self._remains_embedding_update()
+
+        # 处理需要返回的事件信息, 并且清空事件池
+        event_list = self.event_pool.copy()
+        self.event_pool = []
+
         # Action Mask
         mask = np.zeros(self.ACT_SIZE)
         # self.valid should contain valid action *indices* based on OFFSET_ACT
@@ -728,10 +754,14 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
                     mask[a_idx] = 1
         
         return {
-            'event': event_vec.copy(),
-            'global_state': self.global_obs.reshape((self.OBS_SIZE, 4, 9)).copy(),
+            'event_list': event_list,
+            'global_state': self.global_obs.reshape((self.GLOBAL_CHANNAL, 4, 9)).copy(),
             'action_mask': mask
         }
+    
+    def pop_event(self):
+        assert len(self.event_pool) > 0, "Event pool is empty!"
+        self.event_pool.pop()
     
 
     # 算番函数的封装, 用来判断是否可以和牌, 或许可以借用这个接口来算番数, 作为某种间接奖励, 不过恐怕是等到基础的 RL 都完成后再精益求精才会考虑?
