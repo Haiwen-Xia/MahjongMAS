@@ -5,3 +5,4 @@ Mahjong/update/data/
 **/__pycache__/
 **/log/
 **/*.npz
+**/*.pt

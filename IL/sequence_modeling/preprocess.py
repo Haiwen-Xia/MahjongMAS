@@ -32,7 +32,7 @@ def saveData():
         import ipdb; ipdb.set_trace()
     l.append(sum([len(x) for x in obs]))
     import os
-    os.makedirs('/home/dataset-assist-0/data/Mahjong/IL/sequence_modeling_v3/data', exist_ok=True)
+    os.makedirs('/home/dataset-assist-0/data/Mahjong/IL/sequence_modeling/data', exist_ok=True)
     
     lengths = [[] for i in range(4)]
     
@@ -68,13 +68,14 @@ def saveData():
         obs[i] = obs[i][:-1]
         actions[i] = actions[i][:-1]
         lengths[i] = lengths[i][:-1]
-        np.savez(f'/home/dataset-assist-0/data/Mahjong/IL/sequence_modeling_v3/data/{matchid*4+i}.npz'
-            , history = histories[i] 
-            , mask = np.stack([x['action_mask'] for x in obs[i]]).astype(np.int8)
-            , act = np.array(actions[i])
-            , global_state = np.stack([x['global_state'] for x in obs[i]]).astype(np.int8)
-            , lengths = np.array(lengths[i]).astype(np.int32)
-        )
+        if len(lengths[i]) > 0:
+            np.savez(f'/home/dataset-assist-0/data/Mahjong/IL/sequence_modeling/data/{matchid*4+i}.npz'
+                , history = histories[i] 
+                , mask = np.stack([x['action_mask'] for x in obs[i]]).astype(np.int8)
+                , act = np.array(actions[i])
+                , global_state = np.stack([x['global_state'] for x in obs[i]]).astype(np.int8)
+                , lengths = np.array(lengths[i]).astype(np.int32)
+            )
     for x in obs: x.clear()
     for x in actions: x.clear()
 
@@ -160,7 +161,7 @@ def event_to_string(event_vec, agentidx=0):
         return f"{player_str} {action_type_str} {card1_str} {card2_str}"
     
                 
-input_pth = '/home/dataset-assist-0/data/Mahjong/IL/sequence_modeling_v3/data.txt'
+input_pth = '/home/dataset-assist-0/data/Mahjong/IL/sequence_modeling/data.txt'
 if __name__ == '__main__':
     with open(input_pth, encoding='UTF-8') as f:
         line = f.readline()
@@ -277,9 +278,9 @@ if __name__ == '__main__':
                 #filterData()
                 for i in range(4):
                     # obs[i][-1]['event_list'].extend(agents[i].event_pool)
-                    obs[i].append({'event_list': agents[i].event_pool})
+                    obs[i].append(agents[i]._obs())
                     actions[i].append(114514)
                 saveData()
             line = f.readline()
-    with open('count.json', 'w') as f:
+    with open('/home/dataset-assist-0/data/Mahjong/IL/sequence_modeling/data/count.json', 'w') as f:
         json.dump(l, f)

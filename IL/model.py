@@ -3,7 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from conv import ConvBlock, ResidualBlock
-# ---------- 通用模块 ----------
+
+
 class PositionalEncoding(nn.Module):
     """标准 Transformer sine‑cosine 位置编码（batch_first=True）"""
     def __init__(self, d_model, max_len=1024):
@@ -21,6 +22,7 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x):
         return self.pe[:, : x.size(1)]
+
 
 class AttentionBlock(nn.Module):
     """Residual‑Norm wrapper over MultiheadAttention (supports self & cross)."""
@@ -42,6 +44,8 @@ class AttentionBlock(nn.Module):
             key_padding_mask=key_padding_mask    # 用于忽略 padding token
         )
         return self.ln(q + self.drop(out))       # Residual + LayerNorm
+
+
 class TransformerBlock(nn.Module): # 4*512*512
     def __init__(self, d_model, n_heads, dropout=0.1):
         super().__init__()
@@ -62,7 +66,8 @@ class TransformerBlock(nn.Module): # 4*512*512
         ff_output = self.ff(x)
         x = x + self.dropout2(ff_output)
         return self.ln2(x)
-    
+
+
 class Transformer(nn.Module):
     def __init__(self, d_model, n_heads, num_layers, dropout=0.1):
         super().__init__()
@@ -73,6 +78,8 @@ class Transformer(nn.Module):
         for layer in self.layers:
             x = layer(x, key_padding_mask=key_padding_mask)
         return x
+
+
 # ---------- TimeNet ----------
 class TimeNet(nn.Module):
     '''
@@ -170,7 +177,8 @@ class TimeNet(nn.Module):
                 nn.init.normal_(m.weight, mean=0, std=m.embedding_dim ** -0.5)
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)    
+                nn.init.zeros_(m.bias)
+
 if __name__ == "__main__":
     # 测试代码
     model = TimeNet(95, (4, 4, 9), 235)
@@ -191,4 +199,4 @@ if __name__ == "__main__":
         "action_mask": torch.ones(32, 235,device="cuda"),
     }
     output = model(x,mask)
-    print(output.shape)  # 应该是 (32, 235)
+    print(output.shape)
