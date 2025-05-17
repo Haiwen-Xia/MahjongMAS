@@ -192,7 +192,7 @@ class Actor(Process):
 
                     if seat_idx == main_agent_seat_idx_in_env:
                         policies[current_env_agent_name] = model_latest
-                        opponent_model_ids[current_env_agent_name] = f"main_latest_{latest_model_version_id}"
+                        opponent_model_ids[current_env_agent_name] = latest_model_version_id
                         self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using main learning model (ID: {latest_model_version_id})")
                     else: # 这是对手席位
                         if np.random.rand() < p_opponent_historical:
@@ -217,7 +217,7 @@ class Actor(Process):
                                     
                                     self._load_state_dict_to_model(opponent_model_instances[current_env_agent_name], params)
                                     policies[current_env_agent_name] = opponent_model_instances[current_env_agent_name]
-                                    opponent_model_ids[current_env_agent_name] = f"hist_id_{sampled_id}"
+                                    opponent_model_ids[current_env_agent_name] = sampled_id
                                     self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using sampled historical model (ID: {sampled_id})")
                                     historical_model_loaded_successfully = True
                                 else:
@@ -228,17 +228,17 @@ class Actor(Process):
                             if not historical_model_loaded_successfully:
                                 self.logger.warning(f"    Seat {seat_idx} ({current_env_agent_name}) will use model_latest as fallback for historical.")
                                 policies[current_env_agent_name] = model_latest 
-                                opponent_model_ids[current_env_agent_name] = f"fallback_latest_{latest_model_version_id}"
+                                opponent_model_ids[current_env_agent_name] = latest_model_version_id
                         else:
                             self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using main learning model (ID: {latest_model_version_id}) as opponent.")
                             policies[current_env_agent_name] = model_latest
-                            opponent_model_ids[current_env_agent_name] = f"as_latest_{latest_model_version_id}"
+                            opponent_model_ids[current_env_agent_name] = latest_model_version_id
             
             # --- 运行一个 episode 并收集数据 ---
-            self.logger.info(f"Actor {self.name}, Ep {episode+1}/{episodes_per_actor_run}. Main model ID: {latest_model_version_id}. "
-                             f"Opponents: P1={opponent_model_ids.get(env.agent_names[1], 'N/A')}, "
-                             f"P2={opponent_model_ids.get(env.agent_names[2], 'N/A')}, "
-                             f"P3={opponent_model_ids.get(env.agent_names[3], 'N/A')}")
+            self.logger.info(f"Actor {self.name}, Ep {episode+1}/{episodes_per_actor_run}. P1={latest_model_version_id}, "
+                             f"P2={opponent_model_ids.get(env.agent_names[1], 'N/A')}, "
+                             f"P3={opponent_model_ids.get(env.agent_names[2], 'N/A')}, "
+                             f"P4={opponent_model_ids.get(env.agent_names[3], 'N/A')}")
 
             try: 
                 obs = env.reset() 
@@ -400,6 +400,12 @@ class Actor(Process):
             # --- 对收集到的 episode 数据进行后处理，计算 GAE 和 TD-Target ---
             # (这部分逻辑与之前的版本类似，假设已根据需要调整和确认对齐方式)
             for agent_name, agent_data in episode_data.items():
+                if agent_name != main_agent_name and opponent_model_ids[agent_name] != latest_model_version_id:
+                    # 如果不是我们关心的学习智能体，则直接跳过后续所有处理
+                    # self.logger.debug(f"Skipping data processing for non-learning agent: {agent_name}") # 可选的调试日志
+                    continue
+
+                
                 T = len(agent_data['action'])
                 if T == 0: continue # 跳过没有动作的 agent/episode
 

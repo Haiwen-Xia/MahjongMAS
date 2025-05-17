@@ -1,7 +1,7 @@
 {
     "evaluator_id": "offline_fixed_match_002",
     "log_base_dir": "/home/dataset-assist-0/data/Mahjong/RL/offline_evaluation",
-    "experiment_name": "huge_model_pool_trained_longer_added",
+    "experiment_name": "Freeze_Critic_FE_Entropy=-1e-4",
     "in_channels": 187,
     "device": "cpu",
     "evaluation_episodes": 256,
@@ -10,16 +10,16 @@
     },
     "model_details_dict": {
         "supervised_baseline" : {
-            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Ignore_Single_Action_TimeStep/model_iter_725.pt"
+            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Separate_Feature_Extractor/model_iter_249.pt"
         },
-        "strange_convergence_filtered" : {
-            "model_dir": "/home/dataset-assist-0/data/Mahjong/RL/model/Ignore_Single_Action_TimeStep/model_iter_1903.pt"
+        "RL_v1" : {
+            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Freeze_Critic_FE_Entropy=-1e-4/model_iter_1412.pt"
         },
-        "huge_model_pool": {
-            "model_dir": "/home/dataset-assist-0/data/Mahjong/RL/model/Diverse_Opponents_model_pool_size=48_lambda=0.99/model_iter_609.pt"
+        "RL_v2" : {
+            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Freeze_Critic_FE_Entropy=-1e-4/model_iter_2574.pt"
         },
-        "huge_model_pool_trained_longer": {
-            "model_dir": "/home/dataset-assist-0/data/Mahjong/RL/model/Diverse_Opponents_model_pool_size=48_lambda=0.99/model_iter_955.pt"
+        "RL_v3" : {
+            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Freeze_Critic_FE_Entropy=-1e-4/model_iter_4907.pt"
         }
     }
 }

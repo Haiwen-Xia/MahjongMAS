@@ -119,20 +119,18 @@ class ResNet34AC(nn.Module):
     def __init__(self, in_channels):
         super(ResNet34AC, self).__init__()
 
-        self.feature_extractor = ResNetFeatureExtractor(in_channels)
+        self.feature_extractor_actor = ResNetFeatureExtractor(in_channels)
+        self.feature_extractor_critic = ResNetFeatureExtractor(in_channels)
         self.flatten = nn.Flatten()
-        self.actor = nn.Linear(4 * 9 * 64, 235)
-        self.critic = nn.Linear(4 * 9 * 64, 1)
-
-    def _extract_feature(self, input_dict):  
-        x = self.feature_extractor(input_dict)
-        return x
+        self.actor_head = nn.Linear(4 * 9 * 64, 235)
+        self.critic_head = nn.Linear(4 * 9 * 64, 1)
     
     def forward(self, input_dict):
-        x = self._extract_feature(input_dict)
+        feature_actor = self.feature_extractor_actor(input_dict)
+        feature_critic = self.feature_extractor_critic(input_dict)
 
-        action_logits = self.actor(self.flatten(x))
-        value = self.critic(self.flatten(x))
+        action_logits = self.actor_head(self.flatten(feature_actor))
+        value = self.critic_head(self.flatten(feature_critic))
 
         action_mask = input_dict["obs"]["action_mask"].float()
         inf_mask = torch.clamp(torch.log(action_mask), -1e38, 1e38)
