@@ -9,3 +9,4 @@
 **/logs
 **/data.txt
 **/tensorboard_logs
+**/*.json
