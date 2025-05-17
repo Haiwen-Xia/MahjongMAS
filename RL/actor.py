@@ -8,7 +8,7 @@ import os # 引入 os 模块用于路径操作
 
 # 导入自定义模块
 from replay_buffer import ReplayBuffer       # 用于存储和提供训练数据的经验回放缓冲区
-from model_pool import ModelPoolClient        # 用于从中央模型池获取最新模型参数的客户端
+from model_pool_extended import ModelPoolClient        # 用于从中央模型池获取最新模型参数的客户端
 from env import MahjongGBEnv                 # 麻将游戏环境
 from feature import FeatureAgent             # 用于处理麻将特征的 Agent
 from model import ResNet34AC                 # Actor 使用的神经网络模型定义 (假设包含策略和价值输出)
@@ -40,7 +40,14 @@ class Actor(Process):
         self.logger = None
         self.writer = None
 
-
+    def _load_state_dict_to_model(self, model_instance, state_dict_to_load):
+        """Helper to load state_dict, handling potential nested dicts from checkpoints."""
+        if isinstance(state_dict_to_load, dict) and 'model_state_dict' in state_dict_to_load:
+            model_instance.load_state_dict(state_dict_to_load['model_state_dict'])
+        else:
+            model_instance.load_state_dict(state_dict_to_load)
+        model_instance.eval() # Set to eval mode after loading
+        
     # 进程启动时执行的主函数
     def run(self):
         """
@@ -75,88 +82,188 @@ class Actor(Process):
             if self.writer: self.writer.close()
             return # 连接失败则退出
 
-        # 创建本地的神经网络模型实例
-        # 需要确保模型定义与 Learner 端一致
+        model_latest = None
         try:
-            model = ResNet34AC(self.config['in_channels']) # 假设模型需要输入通道数作为参数
-            self.logger.info(f"ResNet34AC instance created.")
+            model_latest = ResNet34AC(self.config['in_channels'])
         except Exception as e:
-            self.logger.error(f"Failed to create model instance: {e}. Actor exiting.")
+            self.logger.error(f"Failed to create main model instance: {e}. Actor exiting.", exc_info=True)
             if self.writer: self.writer.close()
             return
 
-        # 加载初始模型参数
-        model_version_id = "N/A" # 初始化版本号
+        # 加载初始主模型参数
+        latest_model_version_id = "N/A"
         try:
-            version = model_pool.get_latest_model() # 获取当前最新模型的版本信息
-            model_version_id = version.get('id', 'N/A')
-            self.logger.info(f"Got latest model version info: {model_version_id}")
-            state_dict = model_pool.load_model(version) # 根据版本信息加载模型的状态字典
-            model.load_state_dict(state_dict)         # 将加载的状态字典应用到本地模型
-            self.logger.info(f"Loaded initial model version {model_version_id}")
+            latest_version_meta = model_pool.get_latest_model_metadata()
+            if latest_version_meta:
+                latest_model_version_id = latest_version_meta.get('id', 'N/A')
+                self.logger.info(f"Got latest model metadata from pool: ID {latest_model_version_id}")
+                state_dict = model_pool.load_model_parameters(latest_version_meta)
+                if state_dict:
+                    self._load_state_dict_to_model(model_latest, state_dict)
+                    self.logger.info(f"Loaded initial parameters for model_latest, version {latest_model_version_id}")
+                else:
+                    self.logger.error(f"Failed to load parameters for latest model ID {latest_model_version_id}. Actor exiting.")
+                    return
+            else:
+                self.logger.error("Failed to get any model metadata from pool at startup. Actor exiting.")
+                return
         except Exception as e:
-            self.logger.error(f"Failed to load initial model - {e}. Actor exiting.")
-            if self.writer: self.writer.close()
-            return # 加载失败则退出
-
-        # 初始化麻将环境
-        try:
-            # 'agent_clz': FeatureAgent 指定了环境内部使用哪个类来处理特征转换
-            env = MahjongGBEnv(config = {'agent_clz': FeatureAgent})
-            self.logger.info(f"Mahjong environment created.")
-        except Exception as e:
-            self.logger.error(f"Failed to create Mahjong environment: {e}. Actor exiting.")
+            self.logger.error(f"Failed to load initial model_latest: {e}. Actor exiting.", exc_info=True)
             if self.writer: self.writer.close()
             return
 
-        # 设置策略字典，这里是自对弈 (self-play) 设置，所有玩家都使用同一个最新的模型实例
-        policies = {player : model for player in env.agent_names}
+        env = None
+        try:
+            env_config = self.config.get('env_config', {})
+            if 'agent_clz' not in env_config: # Default if not specified
+                 # Assuming FeatureAgent is the one compatible with MahjongGBEnv's internal processing
+                env_config['agent_clz'] = FeatureAgent 
+            self.logger.info(f"Actor using env_config: {env_config}")
+            env = MahjongGBEnv(config=env_config)
+            self.logger.info(f"Mahjong environment created with agent class: {env_config['agent_clz'].__name__}.")
+        except Exception as e:
+            self.logger.error(f"Failed to create Mahjong environment: {e}. Actor exiting.", exc_info=True)
+            if self.writer: self.writer.close()
+            return
 
-        # 开始收集数据的主循环，运行指定数量的 episode
-        total_actor_steps = 0 # 记录该 actor 的总步数，可用于 TensorBoard
-        for episode in range(self.config['episodes_per_actor']):
-            self.logger.info(f"Starting Episode {episode+1}/{self.config['episodes_per_actor']} using Model Version {model_version_id}")
+        # --- 对手模型管理 ---
+        # policies: 字典，存储当前 episode 中每个 agent_name -> model_instance 的映射
+        policies = {} 
+        # opponent_model_instances: 字典，存储为对手席位专门创建（或复用）的模型实例
+        # 键是 agent_name (例如 "player_1"), 值是 ResNet34AC 实例
+        opponent_model_instances = {} 
+        # opponent_model_ids: 字典，存储对手席位当前使用的模型ID (如果是从pool加载的)
+        opponent_model_ids = {} 
+
+        # 从配置获取对手选择参数
+        p_opponent_historical = self.config.get('p_opponent_historical', 0.2) # 例如 20% 概率使用历史模型
+        opponent_sampling_k = self.config.get('opponent_sampling_k', 8)
+        opponent_model_change_interval = self.config.get('opponent_model_change_interval', 1) # 每1个episode就可能换
+        actor_update_model_latest_interval = self.config.get('actor_model_change_interval', 1)
+
+        total_actor_steps = 0
+        episodes_per_actor_run = self.config.get('episodes_per_actor', 1000) # 总共运行多少局
+
+        for episode in range(episodes_per_actor_run):
             episode_start_time = time.time()
 
-            # 在每个 episode 开始前尝试更新模型
-            try:
-                latest = model_pool.get_latest_model() # 查询最新的模型版本
-                latest_id = latest.get('id', 'N/A')
-                # 如果模型池中的模型版本比当前本地版本新 (确保比较的是有效 ID)
-                if isinstance(latest_id, (int, float)) and isinstance(model_version_id, (int, float)) and latest_id > model_version_id:
-                    self.logger.info(f"Found newer model version {latest_id}. Updating...")
-                    state_dict = model_pool.load_model(latest) # 加载新模型的参数
-                    model.load_state_dict(state_dict)         # 更新本地模型
-                    model_version_id = latest_id              # 更新本地记录的模型版本
-                    self.logger.info(f"Updated local model to version {model_version_id}")
-                elif latest_id != model_version_id: # ID 不同但不是更新（可能是回滚或错误），记录一下
-                    self.logger.warning(f"Model pool version {latest_id} differs but not newer than local {model_version_id}.")
-            except Exception as e:
-                self.logger.warning(f"Failed to check/update model - {e}. Continuing with version {model_version_id}.")
+            # --- 1. 定期更新主模型 (model_latest) ---
+            if episode % actor_update_model_latest_interval == 0:
+                try:
+                    current_pool_latest_meta = model_pool.get_latest_model_metadata()
+                    if current_pool_latest_meta:
+                        current_pool_latest_id = current_pool_latest_meta.get('id', 'N/A')
+                        is_newer = False
+                        # 版本比较逻辑 (确保 ID 类型一致或可比较)
+                        if isinstance(current_pool_latest_id, type(latest_model_version_id)):
+                            if isinstance(current_pool_latest_id, (int, float)):
+                                is_newer = current_pool_latest_id > latest_model_version_id
+                            elif isinstance(current_pool_latest_id, str):
+                                # 假设版本ID越高越新；对于字符串ID，可能需要更复杂的比较逻辑
+                                is_newer = current_pool_latest_id > latest_model_version_id 
+                        
+                        if is_newer and current_pool_latest_id != latest_model_version_id: # 避免不必要的加载
+                            self.logger.info(f"Actor {self.name}: Found newer main model ID {current_pool_latest_id} (current: {latest_model_version_id}). Updating model_latest.")
+                            new_state_dict = model_pool.load_model_parameters(current_pool_latest_meta)
+                            if new_state_dict:
+                                self._load_state_dict_to_model(model_latest, new_state_dict)
+                                latest_model_version_id = current_pool_latest_id
+                                self.logger.info(f"Actor {self.name}: Updated model_latest to version {latest_model_version_id}.")
+                            else:
+                                self.logger.warning(f"Actor {self.name}: Failed to load parameters for new main model ID {current_pool_latest_id}. Continuing with old version.")
+                        elif current_pool_latest_id != latest_model_version_id and latest_model_version_id != "N/A":
+                             self.logger.debug(f"Actor {self.name}: Pool latest ID {current_pool_latest_id} is not considered newer than local {latest_model_version_id}.")
+                    else:
+                        self.logger.warning(f"Actor {self.name}: Could not get latest model metadata from pool for updating model_latest.")
+                except Exception as e:
+                    self.logger.warning(f"Actor {self.name}: Error checking/updating model_latest: {e}", exc_info=True)
+            
+            
+            # --- 2. 定期决定并设置本轮对局中所有席位的策略 ---
+            if episode % opponent_model_change_interval == 0:
+                self.logger.info(f"Actor {self.name}, Episode {episode + 1}: Re-evaluating/setting policies for all seats.")
+                policies.clear()
+                opponent_model_ids.clear() # 清除上一轮的对手ID记录
 
+                main_agent_seat_idx_in_env = np.random.randint(0, 4)
+                main_agent_name = env.agent_names[main_agent_seat_idx_in_env]
+                for seat_idx in range(4): # 遍历所有0, 1, 2, 3号席位
+                    current_env_agent_name = env.agent_names[seat_idx] # 获取该席位对应的 player_name
+
+                    if seat_idx == main_agent_seat_idx_in_env:
+                        policies[current_env_agent_name] = model_latest
+                        opponent_model_ids[current_env_agent_name] = f"main_latest_{latest_model_version_id}"
+                        self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using main learning model (ID: {latest_model_version_id})")
+                    else: # 这是对手席位
+                        if np.random.rand() < p_opponent_historical:
+                            self.logger.debug(f"  Seat {seat_idx} ({current_env_agent_name}): Attempting to sample historical opponent (k={opponent_sampling_k}).")
+                            exclude_ids_list = [latest_model_version_id] if latest_model_version_id != "N/A" else None
+                            
+                            sampled_meta = model_pool.sample_model_metadata(
+                                strategy='latest_k', 
+                                k=opponent_sampling_k
+                                # exclude_ids=exclude_ids_list,
+                                # require_distinct_from_latest=True
+                            )
+                            
+                            historical_model_loaded_successfully = False
+                            if sampled_meta:
+                                sampled_id = sampled_meta.get('id', 'N/A')
+                                params = model_pool.load_model_parameters(sampled_meta)
+                                if params:
+                                    if current_env_agent_name not in opponent_model_instances:
+                                        opponent_model_instances[current_env_agent_name] = ResNet34AC(self.config['in_channels'])
+                                        self.logger.info(f"    Created new model instance for opponent {current_env_agent_name}")
+                                    
+                                    self._load_state_dict_to_model(opponent_model_instances[current_env_agent_name], params)
+                                    policies[current_env_agent_name] = opponent_model_instances[current_env_agent_name]
+                                    opponent_model_ids[current_env_agent_name] = f"hist_id_{sampled_id}"
+                                    self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using sampled historical model (ID: {sampled_id})")
+                                    historical_model_loaded_successfully = True
+                                else:
+                                    self.logger.warning(f"    Failed to load params for sampled ID {sampled_id}.")
+                            else:
+                                self.logger.warning(f"    Failed to sample historical model from pool.")
+                            
+                            if not historical_model_loaded_successfully:
+                                self.logger.warning(f"    Seat {seat_idx} ({current_env_agent_name}) will use model_latest as fallback for historical.")
+                                policies[current_env_agent_name] = model_latest 
+                                opponent_model_ids[current_env_agent_name] = f"fallback_latest_{latest_model_version_id}"
+                        else:
+                            self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using main learning model (ID: {latest_model_version_id}) as opponent.")
+                            policies[current_env_agent_name] = model_latest
+                            opponent_model_ids[current_env_agent_name] = f"as_latest_{latest_model_version_id}"
+            
             # --- 运行一个 episode 并收集数据 ---
-            try: # 包裹整个 episode 运行以捕获环境或模型错误
-                obs = env.reset() # 重置环境，获取初始观察状态
-            except Exception as e:
-                self.logger.error(f"Failed to reset environment for episode {episode+1}: {e}. Skipping episode.")
-                continue # 跳过这个 episode
+            self.logger.info(f"Actor {self.name}, Ep {episode+1}/{episodes_per_actor_run}. Main model ID: {latest_model_version_id}. "
+                             f"Opponents: P1={opponent_model_ids.get(env.agent_names[1], 'N/A')}, "
+                             f"P2={opponent_model_ids.get(env.agent_names[2], 'N/A')}, "
+                             f"P3={opponent_model_ids.get(env.agent_names[3], 'N/A')}")
 
-            # 初始化用于存储当前 episode 数据的字典
+            try: 
+                obs = env.reset() 
+            except Exception as e:
+                self.logger.error(f"Failed to reset environment for episode {episode+1}: {e}. Skipping episode.", exc_info=True)
+                continue 
+
             episode_data = {agent_name: {
                 'state' : {'observation': [], 'action_mask': []},
                 'action' : [], 'reward' : [], 'value' : [], 'log_prob' : []
             } for agent_name in env.agent_names}
-            # 存储每个智能体的总原始奖励
             episode_raw_rewards = {agent_name: 0.0 for agent_name in env.agent_names}
 
-            done = False # 标记 episode 是否结束
-            step_count = 0 # 记录步数
+            done = False 
+            step_count = 0 
+            record_data_for_agent_this_step = {}
+
             # 在一个 episode 内部循环，直到结束
             while not done:
                 step_count += 1
                 total_actor_steps += 1 # 增加总步数计数器
                 actions = {}
                 values = {}
+
+                record_step_for_agent = {} 
 
                 # 为当前 obs 字典中的每个 agent 获取动作
                 current_agents = list(obs.keys()) # 获取当前需要行动的 agent
@@ -167,6 +274,24 @@ class Actor(Process):
                     
                     agent_data = episode_data[agent_name] # 获取该 agent 的数据存储区
                     state = obs[agent_name]             # 获取该 agent 当前的观察状态
+
+                    # 检查 action_mask
+                    action_mask_numpy = np.array(state['action_mask'])
+                    num_valid_actions = action_mask_numpy.sum()
+
+                    # 根据配置决定是否过滤此步骤的数据
+                    should_filter_this_agent_step = self.config.get('filter_single_action_steps', True) and \
+                                                    num_valid_actions <= 1
+                    
+                    record_step_for_agent[agent_name] = not should_filter_this_agent_step
+
+                    if record_step_for_agent[agent_name]:
+                        # 如果记录，则存储状态信息
+                        agent_data['state']['observation'].append(state['observation'])
+                        agent_data['state']['action_mask'].append(action_mask_numpy) # 存储 numpy 格式的 mask
+                        self.logger.debug(f"Step {step_count} for agent {agent_name}: Recording data (num_valid_actions: {num_valid_actions}).")
+                    else:
+                        self.logger.debug(f"Step {step_count} for agent {agent_name}: Filtering data (num_valid_actions: {num_valid_actions}).")
 
                     # 存储原始观察状态和动作掩码 (numpy 格式)
                     agent_data['state']['observation'].append(state['observation'])
@@ -185,9 +310,9 @@ class Actor(Process):
 
                     # 模型推理获取动作
                     try:
-                        model.eval() # 设置为评估模式
+                        policies[agent_name].eval() # 设置为评估模式
                         with torch.no_grad():
-                            logits, value = model(model_input) # 获取动作 logits 和状态价值 V(s)
+                            logits, value = policies[agent_name](model_input) # 获取动作 logits 和状态价值 V(s)
                             action_dist = torch.distributions.Categorical(logits=logits)
 
                             action_tensor = action_dist.sample() # Sample action as a tensor
@@ -203,9 +328,12 @@ class Actor(Process):
                     # 存储选择的动作、价值（和 log_prob）
                     actions[agent_name] = action_item
                     values[agent_name] = value
-                    agent_data['action'].append(actions[agent_name])
-                    agent_data['value'].append(values[agent_name])
-                    agent_data['log_prob'].append(log_prob_item)
+
+                    if record_step_for_agent[agent_name]:
+                        # 如果记录，则存储动作、价值和log_prob
+                        agent_data['action'].append(actions[agent_name])
+                        agent_data['value'].append(values[agent_name])
+                        agent_data['log_prob'].append(log_prob_item)
 
                 if done: break # 如果在动作选择中出错，跳出 while 循环
 
@@ -250,10 +378,9 @@ class Actor(Process):
             # --- Episode 结束 ---
             episode_duration = time.time() - episode_start_time
 
-            # TODO: average reward 在麻将中没有意义, 因为这是零和的
-            avg_episode_reward = sum(episode_raw_rewards.values()) / len(env.agent_names) if env.agent_names else 0
+            lastest_model_reward = episode_raw_rewards[main_agent_name]
             self.logger.info(f"Episode {episode+1} finished in {step_count} steps ({episode_duration:.2f}s). "
-                        f"Model Version {model_version_id}. Avg Raw Reward: {avg_episode_reward:.2f}.")
+                        f"Model Version {latest_model_version_id}. Latest Model Raw Reward: {lastest_model_reward:.2f}.")
             
             
             # --- 记录到 TensorBoard ---
@@ -261,7 +388,7 @@ class Actor(Process):
                 try:
                      # 使用 actor 内部的总步数或 episode 数作为 x 轴
                      # 如果能获取全局步数会更好，这里用 episode
-                     self.writer.add_scalar('Reward/EpisodeTotalAvg', avg_episode_reward, episode + 1)
+                     self.writer.add_scalar('Reward/LastestModel', lastest_model_reward, episode + 1)
                      self.writer.add_scalar('Episode/Length', step_count, episode + 1)
                      # 可以记录每个 agent 的奖励
                      for agent_id, total_reward in episode_raw_rewards.items():

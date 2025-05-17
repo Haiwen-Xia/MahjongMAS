@@ -6,3 +6,6 @@
 **/*.log
 **/model/
 **/RL/log
+**/logs
+**/data.txt
+**/tensorboard_logs

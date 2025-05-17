@@ -15,7 +15,7 @@ from utils import setup_process_logging_and_tensorboard
 # It's often better to load config from a file (e.g., YAML, JSON) or use argparse
 CONFIG = {
     # Experiment Meta
-    'experiment_name': "Freeze_Policy_Head_and_Feature_Extractor_for_1000_iter_actor_lr=1e-4_entropy_coeff=0.003", # Use underscores or avoid special chars for dir names
+    'experiment_name': "Diverse_Opponents_model_pool_size=48_lambda=0.99", # Use underscores or avoid special chars for dir names
     'log_base_dir': '/home/dataset-assist-0/data/Mahjong/RL/log', # Base directory for logs and TensorBoard
     'checkpoint_base_dir': '/home/dataset-assist-0/data/Mahjong/RL/model', # Base directory for checkpoints
 
@@ -30,8 +30,8 @@ CONFIG = {
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
 
     # Distributed Setup
-    'model_pool_size': 20,
-    'model_pool_name': 'model-pool-v1', # Example name
+    'model_pool_size': 48,
+    'model_pool_name': 'model-pool-v2', # Example name
     'num_actors': 8,
     'episodes_per_actor': 25000, # How many episodes each actor runs before exiting
 
@@ -44,21 +44,29 @@ CONFIG = {
     'lr_value_head': 1e-4,
     'lr_policy_head_finetune': 1e-4,
     'lr_feature_extractor_finetune': 1e-4,
-    'unfreeze_policy_head_after_iters': 1000,
-    'unfreeze_feature_extractor_after_iters': 1000,
+    'unfreeze_policy_head_after_iters': 500,
+    'unfreeze_feature_extractor_after_iters': 500,
     'use_lr_scheduler': True,
-    "warmup_iterations": 2000,
+    "warmup_iterations": 1000,
     'total_iterations_for_lr_decay': 500000,
     'initial_lr_for_warmup': 1e-5,
     'min_lr': 1e-6, # Minimum learning rate for scheduler
 
     'gamma': 0.98,      # Discount factor for GAE/TD Target
-    'lambda': 0.95,     # Lambda for GAE
+    'lambda': 0.99,     # Lambda for GAE
     'clip': 0.2,        # PPO clip epsilon
     'grad_clip_norm': 0.3,
     'value_coeff': 0.5, # Coefficient for value loss (common to scale down)
-    'entropy_coeff': 0.003,# Coefficient for entropy bonus
+    'entropy_coeff': 0.001,# Coefficient for entropy bonus
     'ckpt_save_interval_seconds': 600, # Save checkpoint every N seconds (e.g., 10 minutes)
+    'filter_single_action_steps': True, # 是否过滤掉只有单个可能 action 的时间步
+
+    # 多样化 model_pool
+    'p_opponent_historical' : 0.2,
+    'opponent_sampling_k' : 45, 
+    'opponent_model_change_interval': 5, # 每多少个 episode 替换一次对手
+    'actor_model_change_interval': 5,
+
 
     # Added for potential use in Learner/Actor logging/config
     'log_interval_learner': 100, # Log Learner stats every N iterations

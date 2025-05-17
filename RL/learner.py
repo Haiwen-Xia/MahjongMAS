@@ -15,7 +15,7 @@ from utils import setup_process_logging_and_tensorboard # 导入日志和 Tensor
 
 # 导入自定义模块
 from replay_buffer import ReplayBuffer      # 经验回放缓冲区，用于存储 Actor 收集的数据并供 Learner 采样
-from model_pool import ModelPoolServer      # 模型池服务器，用于管理和分发模型版本
+from model_pool_extended import ModelPoolServer      # 模型池服务器，用于管理和分发模型版本
 # 假设您的模型定义在 model.py 中
 from model import ResNet34AC, ResNet34 # , ResNetFeatureExtractor # 确保导入了需要的模型类
 from collections import OrderedDict # 用于有序字典，保持参数加载顺序

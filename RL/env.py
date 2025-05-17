@@ -15,7 +15,7 @@ class Error(Exception):
 class MahjongGBEnv():
     
     agent_names = ['player_%d' % i for i in range(1, 5)]
-    
+
     def __init__(self, config):
         assert 'agent_clz' in config, "must specify agent_clz to process features!"
         self.agentclz = config['agent_clz']
@@ -27,14 +27,17 @@ class MahjongGBEnv():
         self.observation_space = self.agentclz.observation_space
         self.action_space = self.agentclz.action_space
     
-    def reset(self, prevalentWind = -1, tileWall = ''):
+    def reset(self, prevalentWind = -1, tileWall = '', use_random_seed=None):
         # Create agents to process features
         self.agents = [self.agentclz(i) for i in range(4)]
         self.reward = None
         self.done = False
         # Init random seed
-        if self.variety > 0:
+        if use_random_seed is not None:
+            random.seed(use_random_seed)
+        elif self.variety > 0:
             random.seed(self.r.randint(0, self.variety - 1))
+        
         # Init prevalent wind
         self.prevalentWind = random.randint(0, 3) if prevalentWind < 0 else prevalentWind
         for agent in self.agents:
