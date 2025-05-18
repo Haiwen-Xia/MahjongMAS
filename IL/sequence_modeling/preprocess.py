@@ -42,10 +42,9 @@ def saveData():
     
     for i in range(4):
         lengths[i] = [len(obs['event_list']) for obs in obs[i]]
-        
         for j in range(1,len(obs[i])):
             lengths[i][j] = lengths[i][j-1] + lengths[i][j]
-    
+    assert min(lengths[i][0] for i in range(4)) == 1
     histories = []
     for i in range(4):
         try:
@@ -56,8 +55,6 @@ def saveData():
 
     L = len(histories[0])
     
-    for i in range(5):
-        print(event_to_string(histories[0][i],0))
     
     for i in range(1,4):
         try:
@@ -164,7 +161,7 @@ def event_to_string(event_vec, agentidx=0):
         return f"{player_str} {action_type_str} {card1_str} {card2_str}"
     
                 
-input_pth = 'sample.txt'
+input_pth = 'data.txt'
 if __name__ == '__main__':
     with open(input_pth, encoding='UTF-8') as f:
         line = f.readline()
@@ -178,8 +175,6 @@ if __name__ == '__main__':
                 matchid += 1
                 if matchid % 1 == 0:
                     print('Processing match %d %s...' % (matchid, t[1]))
-                if matchid == 1 :
-                    break
             elif t[0] == 'Wind':
                 for agent in agents:
                     agent.request2obs(line)
@@ -258,7 +253,7 @@ if __name__ == '__main__':
                     actions[p].append(agents[p].response2action('Hu'))
                 if t[2] !=  "Deal":
                     
-                    checklength(agents, line)
+                    pass #checklength(agents, line)
                 # Deal with Ignore clause
                 if t[2] in ['Peng', 'Gang', 'Hu']:
                     for k in range(5, 15, 5):

@@ -70,6 +70,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
     TILES_FOR_FEATURE = TILE_LIST + [NONE_TILE_STR]
     TILE_TO_IDX_FEATURE = {tile: i for i, tile in enumerate(TILES_FOR_FEATURE)}
     NONE_TILE_IDX_FEATURE = TILE_TO_IDX_FEATURE[NONE_TILE_STR]
+    # print(TILE_TO_IDX_FEATURE)
 
     # ===== 定义 event 向量 =====
 
@@ -87,7 +88,7 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
         'WIN': 7,
         'NO_ACTION': 8
     }
-    NUM_ACTION_TYPES = 11
+    NUM_ACTION_TYPES = 9
 
     # 3. 可能涉及的第一张牌 (Primary card): 35 维 one-hot 向量, 其中一个涉及的是 None
 
@@ -215,6 +216,11 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
             # 获取摸到的牌
             tile = t[1]
 
+            self.current_event_player_relative = 0
+            self.current_event_action_type_idx = self.ACTION_TYPES_DEF['DRAW_TILE']
+            self.current_event_card1_str = tile
+            self.append_event()
+
             # 初始置空可用操作空间
             self.valid = []
 
@@ -246,10 +252,6 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
                     if packType == 'PENG' and tile in self.hand:
                         self.valid.append(self.OFFSET_ACT['BuGang'] + self.OFFSET_TILE[tile])
 
-            self.current_event_player_relative = 0
-            self.current_event_action_type_idx = self.ACTION_TYPES_DEF['DRAW_TILE']
-            self.current_event_card1_str = tile
-            self.append_event()
             # 因为摸牌后我们一定需要执行某个操作, 所以我们需要返回一个 obs
             return self._obs()
 
