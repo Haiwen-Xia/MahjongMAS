@@ -7,7 +7,7 @@ from dataset import get_mahjong_dataloader
 from model import TimeNet
 import argparse
 from tqdm import tqdm
-
+import ipdb
 def parse_args():
     parser = argparse.ArgumentParser(description="麻将AI模型训练")
     parser.add_argument("--data_dir", type=str, default='data', help="数据目录")
@@ -21,7 +21,7 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout率")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="设备")
     parser.add_argument("--num_layers", type=int, default=6, help="Transformer层数")
-    parser.add_argument("--dataset", type=str, default="efficient", choices=["efficient", "time","batch_file"], help="数据集类型")
+    parser.add_argument("--dataset", type=str, default="batch_file", choices=["efficient", "time","batch_file"], help="数据集类型")
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="预热步数占总步数的比例")
     parser.add_argument("--scheduler", type=str, default="cosine_warmup", 
                         choices=["cosine_warmup", "linear_warmup", "constant"], 
@@ -42,7 +42,14 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, scheduler=N
         action_mask = batch["action_mask"].to(device)
         action = batch["action"].to(device)
         pad_mask = batch["pad_mask"].to(device)
-        
+        # for key, value in batch.items():
+        #     if isinstance(value, torch.Tensor):
+        #         if torch.isnan(value).any():
+        #             print(f"Error: NaN found in batch['{key}'] at step {i}")
+        #             ipdb.set_trace()
+        #         if torch.isinf(value).any():
+        #             print(f"Error: Inf found in batch['{key}'] at step {i}")
+        #             ipdb.set_trace()
         # 构建模型输入
         model_input = {
             "history": history,
@@ -59,6 +66,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, scheduler=N
         
         # 反向传播
         loss.backward()
+        # grad_clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)        
         optimizer.step()
         # 更新学习率
         if scheduler is not None:
@@ -76,14 +85,16 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, scheduler=N
         # 更新进度条
         pbar.set_postfix({
             "loss": total_loss / (i + 1),
-            "acc": correct / total
+            "acc": correct / total,
+            'norm': grad_norm,
         })
         
         # 记录到TensorBoard
         step = epoch * len(dataloader) + i
         writer.add_scalar("train/loss", loss.item(), step)
         writer.add_scalar("train/accuracy", correct / total, step)
-    
+        writer.add_scalar("train/grad_norm", grad_norm, step)
+
     return total_loss / len(dataloader), correct / total
 
 def validate(model, dataloader, device, epoch, writer):
@@ -144,14 +155,15 @@ def main():
     log_dir = os.path.join(args.log_dir, timestamp)
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
-    _name = args.dataset
+
     # 获取数据加载器
     train_loader = get_mahjong_dataloader(
         args.data_dir, 
         batch_size=args.batch_size, 
         split='train', 
         shuffle=True,
-        name=_name
+        name=args.dataset,
+        num_workers=8
     )
     
     val_loader = get_mahjong_dataloader(
@@ -159,7 +171,7 @@ def main():
         batch_size=args.batch_size, 
         split='val', 
         shuffle=False,
-        name=_name
+        name=args.dataset
     )
 
     # 初始化模型

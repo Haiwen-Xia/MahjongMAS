@@ -159,7 +159,7 @@ class TimeNet(nn.Module):
 
             # ---- ④ actor head ----
             logits = self.fc(state.squeeze(1))                    # (B,|A|)
-            inf_mask = torch.clamp(torch.log(batch["action_mask"]), -1e38, 1e38)
+            inf_mask = torch.clamp(torch.log(batch["action_mask"]+1e-9), -1e38, 1e38)
             return logits + inf_mask
         except Exception as e:
             print(f"模型前向传播错误: {e}")

@@ -193,9 +193,9 @@ class EfficientMahjongDataset(Dataset):
 
 class BatchFileMahjongDataset(Dataset):
     """
-    基于文件批处理的高效麻将数据集实现
+    基于文件批处理的高效麻将数据集实现，支持多进程
     """
-    def __init__(self, data_dir, split_ratio=(0.8, 0.1, 0.1), split='train', random_seed=42):
+    def __init__(self, data_dir, split_ratio=(0.8, 0.1, 0.1), split='train', random_seed=42, cache_size=100):
         """初始化数据集"""
         self.data_dir = data_dir
         self.split = split
@@ -218,86 +218,151 @@ class BatchFileMahjongDataset(Dataset):
         else:  # 'test'
             self.files = npz_files[train_size+val_size:]
         
-        # 只存储文件索引和样本索引的映射，不预加载文件
-        self.file_to_indices = {}  # file_idx -> List[(sample_idx, time_idx)]
-        self.sample_count = 0
+        # 全局索引和块映射
+        self.sample_indices = []  # 全局索引 [(file_idx, sample_idx, time_idx), ...]
+        self.file_to_indices = {}  # 文件索引到样本索引的映射
+        self.file_to_chunk = {}    # 文件索引到块索引的映射
+        self.chunk_to_files = {}   # 块索引到文件列表的映射
+        
+        # 构建索引
         self._build_indices()
         
-        # 当前加载的文件数据
-        self.current_file_data = {}  # file_idx -> file_data
-    
+        # 工作进程安全的缓存
+        self.cache = SimpleCache(maxsize=cache_size)
+        
+        # 兼容旧接口，但改为不实际存储数据的字典
+        self.current_file_data = {}
+        
     def _build_indices(self):
-        """构建所有样本的文件索引映射"""
+        """构建索引和块映射"""
+        global_idx = 0
         for file_idx, file_path in enumerate(self.files):
             try:
-                # 仅加载lengths数据构建索引
+                # 加载长度信息以构建索引
                 lengths = np.load(file_path)['lengths'].tolist()
+                
+                # 初始化这个文件的索引列表
                 self.file_to_indices[file_idx] = []
                 
-                for idx, time_idx in enumerate(lengths):
-                    self.file_to_indices[file_idx].append((idx, time_idx))
-                    self.sample_count += 1
+                for sample_idx, time_idx in enumerate(lengths):
+                    # 添加到全局索引
+                    self.sample_indices.append((file_idx, sample_idx, time_idx))
+                    
+                    # 添加到文件索引映射
+                    self.file_to_indices[file_idx].append((sample_idx, time_idx))
+                    
+                    global_idx += 1
             except Exception as e:
                 print(f"无法加载文件 {file_path}: {e}")
     
     def load_files(self, file_indices):
-        """批量加载多个文件的数据"""
-        # 清空当前加载的文件数据
-        self.current_file_data = {}
+        """
+        兼容旧接口，但不实际清空缓存
+        预加载指定文件到缓存(如果尚未加载)
+        """
+        # 记录当前正在使用的文件集合(为了兼容)
+        self.current_file_data = {idx: True for idx in file_indices}
         
-        # 加载请求的文件
+        # 预加载文件到缓存
         for file_idx in file_indices:
-            if file_idx not in self.file_to_indices:  
+            if file_idx not in self.file_to_indices:
                 continue
                 
-            try:
-                data = np.load(self.files[file_idx])
-                self.current_file_data[file_idx] = data
-            except Exception as e:
-                print(f"加载文件 {self.files[file_idx]} 失败: {e}")
+            # 检查是否已缓存
+            if self.cache.get(file_idx) is None:
+                try:
+                    data = np.load(self.files[file_idx])
+                    self.cache.set(file_idx, data)
+                except Exception as e:
+                    print(f"加载文件 {self.files[file_idx]} 失败: {e}")
     
-    def __len__(self):
-        return self.sample_count
+    def _get_file_data(self, file_idx):
+        """获取文件数据，优先从缓存读取"""
+        # 从缓存获取
+        data = self.cache.get(file_idx)
+        if data is not None:
+            return data
+            
+        # 如果缓存中没有，加载文件
+        try:
+            data = np.load(self.files[file_idx])
+            self.cache.set(file_idx, data)
+            return data
+        except Exception as e:
+            print(f"加载文件 {self.files[file_idx]} 失败: {e}")
+            raise e
     
     def get_file_sample_map(self):
         """返回文件索引到样本索引的映射，用于采样器"""
         return self.file_to_indices
-        
+    
+    def __len__(self):
+        return len(self.sample_indices)
+    
     def __getitem__(self, idx):
-        # 由于我们使用自定义采样器，idx将是(file_idx, local_idx)的元组
-        file_idx, local_idx = idx
-        sample_idx, time_idx = self.file_to_indices[file_idx][local_idx]
-        
-        try:
-            # 检查文件是否已加载
-            if file_idx not in self.current_file_data:
-                raise ValueError(f"文件 {file_idx} 未加载，请先调用load_files")
+        if isinstance(idx, tuple):
+            # 兼容旧的(file_idx, local_idx)元组索引
+            file_idx, local_idx = idx
+            sample_idx, time_idx = self.file_to_indices[file_idx][local_idx]
+            
+            try:
+                # 检查文件是否已在current_file_data中(兼容老逻辑)
+                if self.current_file_data and file_idx not in self.current_file_data:
+                    # 自动加载文件
+                    self.load_files([file_idx])
                 
-            data = self.current_file_data[file_idx]
+                # 获取文件数据
+                data = self._get_file_data(file_idx)
+                
+                # 提取所需数据
+                history = data['history'][:time_idx]
+                global_state = data['global_state'][sample_idx]
+                action_mask = data['mask'][sample_idx]
+                action = data['act'][sample_idx]
+                
+                return (
+                    torch.FloatTensor(history),
+                    torch.FloatTensor(global_state),
+                    torch.FloatTensor(action_mask),
+                    torch.LongTensor([action])
+                )
+            except Exception as e:
+                print(f"加载样本错误 file_idx={file_idx}, local_idx={local_idx}: {e}")
+                raise e
+        else:
+            # 支持使用全局整数索引(用于多进程)
+            file_idx, sample_idx, time_idx = self.sample_indices[idx]
             
-            # 提取数据
-            history = data['history'][:time_idx]  # 只获取到当前时间步的历史
-            global_state = data['global_state'][sample_idx] 
-            action_mask = data['mask'][sample_idx] 
-            action = data['act'][sample_idx]
-            
-            return (
-                torch.FloatTensor(history),
-                torch.FloatTensor(global_state),
-                torch.FloatTensor(action_mask),
-                torch.LongTensor([action])
-            )
-        except Exception as e:
-            print(f"加载样本错误 file_idx={file_idx}, local_idx={local_idx}: {e}")
-            raise e
+            try:
+                # 获取文件数据
+                data = self._get_file_data(file_idx)
+                
+                # 提取所需数据
+                history = data['history'][:time_idx]
+                global_state = data['global_state'][sample_idx]
+                action_mask = data['mask'][sample_idx]
+                action = data['act'][sample_idx]
+                
+                return (
+                    torch.FloatTensor(history),
+                    torch.FloatTensor(global_state),
+                    torch.FloatTensor(action_mask),
+                    torch.LongTensor([action])
+                )
+            except Exception as e:
+                print(f"加载样本错误 idx={idx}, file_idx={file_idx}, sample_idx={sample_idx}: {e}")
+                raise e
     
     def get_sample_length(self, idx):
         """返回样本历史序列的长度"""
-        file_idx, local_idx = idx
-        _, time_idx = self.file_to_indices[file_idx][local_idx]
-        return time_idx  # 时间索引即为序列长度
-    
-    
+        if isinstance(idx, tuple):
+            # 兼容旧索引
+            file_idx, local_idx = idx
+            _, time_idx = self.file_to_indices[file_idx][local_idx]
+        else:
+            # 全局整数索引
+            _, _, time_idx = self.sample_indices[idx]
+        return time_idx
 # 2. 修复collate_fn中的键名
 def collate_fn(batch):
     """将一个batch的样本填充到相同长度，并返回符合模型要求的字典格式"""
@@ -333,19 +398,25 @@ def collate_fn(batch):
 
 class FileBatchSampler(Sampler):
     """
-    基于文件批处理的采样器
-    将文件分成chunks批量加载，减少IO操作
+    基于文件批处理的采样器，支持多进程
     """
     def __init__(self, dataset, batch_size=32, shuffle=True, files_per_chunk=50):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.files_per_chunk = files_per_chunk  # 每个chunk包含的文件数
+        self.files_per_chunk = files_per_chunk
         
         # 获取文件到样本的映射
         self.file_sample_map = dataset.get_file_sample_map()
         self.file_indices = list(self.file_sample_map.keys())
         
+        # 创建文件到全局索引的映射
+        self.file_to_global_indices = {}
+        for global_idx, (file_idx, _, _) in enumerate(dataset.sample_indices):
+            if file_idx not in self.file_to_global_indices:
+                self.file_to_global_indices[file_idx] = []
+            self.file_to_global_indices[file_idx].append(global_idx)
+    
     def __iter__(self):
         # 文件级别的随机打乱
         if self.shuffle:
@@ -353,42 +424,33 @@ class FileBatchSampler(Sampler):
         
         # 将文件分成多个chunk
         file_chunks = [
-            self.file_indices[i:i+self.files_per_chunk] 
-            for i in range(0, len(self.file_indices), self.files_per_chunk) # 直接给stride就好了
+            self.file_indices[i:i+self.files_per_chunk]
+            for i in range(0, len(self.file_indices), self.files_per_chunk)
         ]
-        # 处理每个chunk中的文件
+        
         for chunk in file_chunks:
             # 预加载当前chunk中的所有文件
             self.dataset.load_files(chunk)
             
-            # 为当前chunk中的每个文件创建样本索引列表
-            all_samples = []
+            # 创建全局索引列表
+            all_indices = []
             for file_idx in chunk:
-                local_indices = list(range(len(self.file_sample_map[file_idx])))
-                all_samples.extend([(file_idx, local_idx) for local_idx in local_indices])
+                if file_idx in self.file_to_global_indices:
+                    all_indices.extend(self.file_to_global_indices[file_idx])
             
             # 随机打乱样本顺序
             if self.shuffle:
-                random.shuffle(all_samples)
+                random.shuffle(all_indices)
             
             # 生成批次
-            batch = []
-            for sample in all_samples:
-                batch.append(sample)
-                if len(batch) >= self.batch_size:
+            for i in range(0, len(all_indices), self.batch_size):
+                batch = all_indices[i:i+self.batch_size]
+                if len(batch) == self.batch_size or i + self.batch_size >= len(all_indices):
                     yield batch
-                    batch = []
-            
-            # 处理最后一个可能不满的批次
-            if batch:
-                yield batch
     
     def __len__(self):
-        # 估计批次数量
         total_samples = sum(len(samples) for samples in self.file_sample_map.values())
         return (total_samples + self.batch_size - 1) // self.batch_size
-    
-    
 class LocalSampler():
     '''与dataset相配合的采样器'''
     '''利用在一个epoch内每个样本只会生成一次的特点，每个epoch，每个文件会被读入一次；小批量读入，小批量采样'''
@@ -414,7 +476,8 @@ def get_mahjong_dataloader(data_dir, name='efficient', batch_size=32, split='tra
             dataset,
             batch_sampler=sampler,
             collate_fn=collate_fn,
-            num_workers=0  # 由于我们的采样策略，这里不使用多进程
+            num_workers=num_workers,
+            persistent_workers=True# 由于我们的采样策略，这里不使用多进程
         )        
         return dataloader
     else:
@@ -435,15 +498,11 @@ if __name__ == "__main__":
     # 测试数据集
     data_dir = "data"
     dataloader = get_mahjong_dataloader(data_dir,
-                                        name='batch_file',
+                                        name='efficient',
                                         batch_size=32,
                                         split='train',
-                                        shuffle=True)
-    
-    for i, batch in enumerate(dataloader):
-        if i <= 5:
-            print(batch['global_state'][:,:,0,0])
-        if i > 50:
-            break
-        else:
-            print(f"Batch {i}:")
+                                        shuffle=True,
+                                        num_workers=8)
+    from tqdm import tqdm
+    for i, batch in enumerate(tqdm(dataloader)):
+        pass
