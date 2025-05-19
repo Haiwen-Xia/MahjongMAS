@@ -498,11 +498,16 @@ if __name__ == "__main__":
     # 测试数据集
     data_dir = "data"
     dataloader = get_mahjong_dataloader(data_dir,
-                                        name='efficient',
+                                        name='batch_file',
                                         batch_size=32,
                                         split='train',
                                         shuffle=True,
                                         num_workers=8)
     from tqdm import tqdm
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for i, batch in enumerate(tqdm(dataloader)):
-        pass
+        history = batch["history"].to(device)
+        global_state = batch["global_state"].to(device)
+        action_mask = batch["action_mask"].to(device)
+        action = batch["action"].to(device)
+        pad_mask = batch["pad_mask"].to(device)

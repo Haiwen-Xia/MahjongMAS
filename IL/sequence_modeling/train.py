@@ -67,7 +67,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, scheduler=N
         # 反向传播
         loss.backward()
         # grad_clipping
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)        
+        # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)        
         optimizer.step()
         # 更新学习率
         if scheduler is not None:
@@ -86,14 +86,14 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, scheduler=N
         pbar.set_postfix({
             "loss": total_loss / (i + 1),
             "acc": correct / total,
-            'norm': grad_norm,
+            #'norm': grad_norm,
         })
         
         # 记录到TensorBoard
         step = epoch * len(dataloader) + i
         writer.add_scalar("train/loss", loss.item(), step)
         writer.add_scalar("train/accuracy", correct / total, step)
-        writer.add_scalar("train/grad_norm", grad_norm, step)
+     #   writer.add_scalar("train/grad_norm", grad_norm, step)
 
     return total_loss / len(dataloader), correct / total
 

@@ -208,7 +208,8 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
 
         elif action_type_str == 'Draw':
 
-            self.tileWall[self.seatWind] -= 1
+            #self.tileWall[self.seatWind] -= 1
+            self.tileWall[0] -= 1
             
             # 检查下家是否是最后一张牌
             self.wallLast = self.tileWall[1] == 0
