@@ -1,0 +1,7 @@
+**/data
+update/data/
+Mahjong/update/data/
+**/data.txt
+**/__pycache__/
+**/logs/
+**/log/
