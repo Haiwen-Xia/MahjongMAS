@@ -80,7 +80,6 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
         self.current_event_action_type_idx = self.ACTION_TYPES_DEF['NO_ACTION']
         self.current_event_card1_str = self.NONE_TILE_STR
         self.current_event_card2_str = self.NONE_TILE_STR
-        self.valid = [] # Clear valid actions for the new state
 
     def request2obs(self, request: str):
         self._reset_current_event_info()
@@ -119,6 +118,10 @@ class FeatureAgentTimeSeries(MahjongGBAgent):
 
             drawn_tile = t[1]
             self.curTile = drawn_tile
+
+            # 初始置空可用操作空间
+            self.valid = []
+
             self.hand.append(drawn_tile)
             self.shownTiles[drawn_tile] += 1 
             
