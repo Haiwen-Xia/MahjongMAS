@@ -1,173 +1,235 @@
 from multiprocessing.shared_memory import SharedMemory, ShareableList
-import _pickle as cPickle # 使用 cPickle 以获得更好的性能
+import _pickle as cPickle
 import time
-import numpy as np # 之后采样模型时可能用到
+import numpy as np
+import logging # 导入 logging
+
+# logger = logging.getLogger(__name__) # 或者在 __init__ 中获取实例 logger
 
 class ModelPoolServer:
-    """
-    模型池服务器端。
-    负责接收新的模型参数 (state_dict)，将其存储在共享内存中，并管理模型元数据。
-    它使用一个固定大小的循环缓冲区来存储模型。当缓冲区满时，新的模型会覆盖最旧的模型 (FIFO)。
-    """
-    
     def __init__(self, capacity, name):
-        """
-        初始化模型池服务器。
+        self.capacity = capacity
+        self.n = 0 
+        self.model_list = [None] * capacity
+        self.metadata_slot_bytes = 1024
+        
+        # 获取一个独立的 logger 实例
+        self.logger = logging.getLogger(f"{__name__}.ModelPoolServer.{name}")
+        # 您可能需要在主程序中配置这个 logger 的处理器和级别
+        if not self.logger.hasHandlers(): # 简易默认配置，如果外部没有配置
+             handler = logging.StreamHandler()
+             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+             handler.setFormatter(formatter)
+             self.logger.addHandler(handler)
+             self.logger.setLevel(logging.INFO)
 
-        Args:
-            capacity (int): 模型池可以存储的最大模型数量。
-            name (str): 用于创建或连接共享内存列表的唯一名称。
-        """
-        self.capacity = capacity # 模型池的容量
-        self.n = 0 # 已推送到池中的模型总数 (用于生成唯一的模型 ID 和计算在循环缓冲区中的位置)
-        self.model_list = [None] * capacity # 服务器端维护的实际模型元数据列表 (包含共享内存对象本身，用于释放)
-        
-        # shared_model_list: 用于在进程间共享模型元数据。
-        # 结构: [metadata_0, metadata_1, ..., metadata_capacity-1, current_total_model_count]
-        # 每个 metadata 包含模型的 ID 和共享内存地址 ('_addr')。
-        # 最后一个元素存储的是 self.n (已推送模型的总数)。
-        self.metadata_slot_bytes = 1024 # 为每个序列化后的元数据条目预留的字节大小 (需要足够大以容纳 cPickle.dumps(metadata))
-        
-        # 创建一个 ShareableList，包含 capacity 个元数据槽位和 1 个计数器槽位。
-        # 用空格字符串初始化元数据槽位，用 self.n 初始化计数器。
+
         try:
-            # 尝试先删除可能已存在的同名共享内存，避免因未正确清理导致的错误
-            # 这在开发和调试时很有用，但在生产环境中可能需要更谨慎的处理
-            _ = ShareableList(name=name) # 尝试连接
-            _.shm.unlink() # 如果连接成功，说明已存在，则尝试删除
-            # print(f"ModelPoolServer: Unlinked existing ShareableList '{name}'.")
-        except FileNotFoundError:
-            # print(f"ModelPoolServer: No existing ShareableList '{name}' to unlink.")
-            pass # 如果不存在，则忽略
+            self.logger.info(f"Attempting to unlink existing ShareableList named '{name}' if it exists.")
+            # 检查是否存在，如果存在则尝试 unlink
+            # Note: Creating a ShareableList just to unlink it can be problematic if another process is actively using it.
+            # A more robust cleanup usually happens at a higher application level or specific cleanup scripts.
+            # For now, keeping a similar logic to before but with logging.
+            try:
+                existing_sl = ShareableList(name=name)
+                existing_sl.shm.close() # Close first
+                existing_sl.shm.unlink()
+                self.logger.info(f"Successfully unlinked pre-existing ShareableList '{name}'.")
+            except FileNotFoundError:
+                self.logger.info(f"No pre-existing ShareableList named '{name}' found to unlink.")
+        except Exception as e_sl_init_unlink:
+            self.logger.warning(f"Exception during pre-unlink of ShareableList '{name}': {e_sl_init_unlink}")
 
-        self.shared_model_list = ShareableList([' ' * self.metadata_slot_bytes] * capacity + [self.n], name=name)
-        # print(f"ModelPoolServer: Created ShareableList '{name}' with capacity {capacity}.")
+
+        try:
+            self.shared_model_list = ShareableList([' ' * self.metadata_slot_bytes] * capacity + [self.n], name=name)
+            self.logger.info(f"ModelPoolServer: Created/Connected to ShareableList '{name}' with capacity {capacity}, slot_bytes {self.metadata_slot_bytes}.")
+        except Exception as e:
+            self.logger.critical(f"ModelPoolServer: CRITICAL - Failed to create/connect to ShareableList '{name}'. Error: {e}", exc_info=True)
+            raise # Re-raise, as this is fundamental
 
     def push(self, state_dict, metadata=None):
-        """
-        将新的模型状态字典推送到模型池。
+        current_model_id_for_log = self.n # 当前要推送的模型的ID
+        self.logger.info(f"[Push model_id:{current_model_id_for_log}] Method started.") # 标记方法开始
 
-        Args:
-            state_dict (dict): PyTorch 模型的 state_dict。
-            metadata (dict, optional): 与此模型相关的额外元数据 (例如训练步数、胜率等)。默认为空字典。
-
-        Returns:
-            dict: 包含模型 ID、共享内存地址和其他传入元数据的完整元数据字典。
-                  还包含一个 'memory' 键，指向服务器端的 SharedMemory 对象 (用于后续可能的 unlink)。
-        """
         if metadata is None:
             metadata = {}
+        self.logger.info(f"[Push model_id:{current_model_id_for_log}] Metadata (initial): {metadata}")
 
-        # 计算当前模型在循环缓冲区中的索引位置
         idx_in_buffer = self.n % self.capacity
+        self.logger.info(f"[Push model_id:{current_model_id_for_log}] Calculated buffer index: {idx_in_buffer}")
         
-        # 如果该位置已有旧模型 (缓冲区已满一轮)，则需要释放旧模型占用的共享内存
+        # 1. 清理旧模型（如果存在）
         if self.model_list[idx_in_buffer] is not None and 'memory' in self.model_list[idx_in_buffer]:
+            old_shm_obj = self.model_list[idx_in_buffer]['memory']
+            old_shm_name = old_shm_obj.name
+            old_model_id_val = self.model_list[idx_in_buffer].get('id', 'N/A')
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] Buffer slot {idx_in_buffer} is full. Unlinking old model ID {old_model_id_val} (SHM name: {old_shm_name}).")
             try:
-                old_shm_name = self.model_list[idx_in_buffer]['memory'].name
-                self.model_list[idx_in_buffer]['memory'].close() # 先 close
-                self.model_list[idx_in_buffer]['memory'].unlink() # 再 unlink
-                # print(f"ModelPoolServer: Unlinked old shared memory {old_shm_name} at index {idx_in_buffer}.")
+                self.logger.info(f"[Push model_id:{current_model_id_for_log}] Closing old SHM: {old_shm_name}")
+                old_shm_obj.close()
+                self.logger.info(f"[Push model_id:{current_model_id_for_log}] Unlinking old SHM: {old_shm_name}")
+                old_shm_obj.unlink()
+                self.logger.info(f"[Push model_id:{current_model_id_for_log}] Successfully unlinked old SHM: {old_shm_name}")
             except FileNotFoundError:
-                # print(f"ModelPoolServer: Old shared memory {old_shm_name} already unlinked or not found.")
-                pass # 可能已经被其他方式释放或从未成功创建
-            except Exception as e:
-                # print(f"ModelPoolServer: Error unlinking old shared memory {old_shm_name}: {e}")
-                pass
-
-
-        # 序列化模型参数
-        data_bytes = cPickle.dumps(state_dict)
+                self.logger.warning(f"[Push model_id:{current_model_id_for_log}] Old SHM {old_shm_name} (for model ID {old_model_id_val}) was already unlinked or not found.")
+            except Exception as e_unlink:
+                self.logger.error(f"[Push model_id:{current_model_id_for_log}] Error unlinking old SHM {old_shm_name} (for model ID {old_model_id_val}): {e_unlink}", exc_info=True)
+        self.logger.info(f"[Push model_id:{current_model_id_for_log}] Old model cleanup finished (if any).")
         
-        
-        # 创建共享内存块来存储序列化后的模型参数
-        # 使用唯一的名称，通常基于 self.n 和基础名称，但 SharedMemory 内部会处理命名
-        # 这里直接让 SharedMemory 生成名称，然后将该名称存入元数据
+        # 2. 序列化模型参数
+        data_bytes = None
         try:
-            shm = SharedMemory(create=True, size=len(data_bytes))
-        except FileExistsError: # 如果碰巧名称冲突 (极小概率，但为了健壮性)
-            # print(f"ModelPoolServer: SharedMemory collision, trying to clean up and retry for model {self.n}")
-            # 尝试清理可能的残留 (这部分逻辑比较复杂，简单处理是附加唯一后缀)
-            try:
-                # 尝试删除同名共享内存，如果它是一个未被跟踪的残留
-                temp_shm = SharedMemory(name=shm.name) # 尝试连接
-                temp_shm.close()
-                temp_shm.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception as e_clean:
-                # print(f"ModelPoolServer: Error cleaning conflicting SHM {shm.name}: {e_clean}")
-                pass
-            # 重试一次或使用更鲁棒的唯一名称生成策略
-            shm = SharedMemory(create=True, size=len(data_bytes))
+            num_keys_in_state_dict = len(state_dict.keys())
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] Pickling state_dict with {num_keys_in_state_dict} keys...")
+            data_bytes = cPickle.dumps(state_dict)
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] State_dict pickled. Serialized data_bytes length: {len(data_bytes)}")
+        except Exception as e_pickle_state:
+            self.logger.critical(f"[Push model_id:{current_model_id_for_log}] CRITICAL - Failed to pickle state_dict: {e_pickle_state}", exc_info=True)
+            return None 
 
-
-        shm.buf[:] = data_bytes[:] # 将序列化数据写入共享内存
-        # print(f'ModelPoolServer: Created model {self.n} in shared memory {shm.name}, size {len(data_bytes)} bytes.')
+        # 3. 创建新的共享内存并写入数据
+        shm = None # 初始化为 None
+        try:
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] Attempting to create SharedMemory with size {len(data_bytes)}...")
+            shm = SharedMemory(create=True, size=len(data_bytes)) # 匿名共享内存
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] SharedMemory '{shm.name}' created. Attempting to write data_bytes to shm.buf...")
+            shm.buf[:] = data_bytes[:]
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] data_bytes successfully written to SHM '{shm.name}'.")
+        except FileExistsError: 
+            self.logger.critical(f"[Push model_id:{current_model_id_for_log}] CRITICAL - FileExistsError when creating unnamed SharedMemory. This is unexpected. SHM system might be unstable.", exc_info=True)
+            # 对于匿名SHM，此错误极不寻常。如果发生，清理已创建的 (如果shm不是None)
+            if shm:
+                shm.close()
+                try: shm.unlink()
+                except: pass # 忽略unlink中的错误
+            return None 
+        except OSError as e_os:
+            self.logger.critical(f"[Push model_id:{current_model_id_for_log}] CRITICAL - OSError when creating/writing SharedMemory (size {len(data_bytes)}). Errno: {e_os.errno}, Message: {e_os.strerror}. Possible SHM exhaustion.", exc_info=True)
+            if shm: # 如果 shm 对象已创建但后续操作（如写入 buf）失败
+                shm.close()
+                try: shm.unlink()
+                except: pass
+            return None 
+        except Exception as e_shm_other:
+            self.logger.critical(f"[Push model_id:{current_model_id_for_log}] CRITICAL - Unexpected error creating/writing SharedMemory: {e_shm_other}", exc_info=True)
+            if shm: 
+                shm.close()
+                try: shm.unlink()
+                except: pass
+            return None
         
-        # 准备元数据
-        current_metadata = metadata.copy() # 复制传入的元数据，以避免修改原始字典
-        current_metadata['_addr'] = shm.name # 存储共享内存的地址 (名称)
-        current_metadata['id'] = self.n # 分配全局唯一的模型 ID
-        current_metadata['timestamp'] = time.time() # 添加时间戳
-        current_metadata['size_bytes'] = len(data_bytes) # 记录模型大小
+        # 4. 准备和序列化元数据
+        current_metadata = metadata.copy()
+        current_metadata['_addr'] = shm.name 
+        current_metadata['id'] = current_model_id_for_log # 使用循环开始时的 self.n 作为当前模型ID
+        current_metadata['timestamp'] = time.time()
+        current_metadata['size_bytes'] = len(data_bytes)
+        self.logger.info(f"[Push model_id:{current_model_id_for_log}] Metadata prepared: {current_metadata}")
 
-        # 更新服务器本地的模型列表 (主要用于管理 SharedMemory 对象以便后续释放)
-        self.model_list[idx_in_buffer] = current_metadata.copy() # 存储元数据副本
-        self.model_list[idx_in_buffer]['memory'] = shm # 存储 SharedMemory 对象本身
+        serialized_metadata = None
+        try:
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] Pickling metadata...")
+            serialized_metadata = cPickle.dumps(current_metadata)
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] Metadata pickled. Serialized_metadata length: {len(serialized_metadata)}")
+        except Exception as e_pickle_meta:
+            self.logger.critical(f"[Push model_id:{current_model_id_for_log}] CRITICAL - Failed to pickle metadata: {e_pickle_meta}", exc_info=True)
+            # 清理已为此模型创建的 SHM，因为元数据无法共享
+            shm.close()
+            try: shm.unlink()
+            except: pass
+            return None
 
-        # 将序列化后的元数据写入 ShareableList，供客户端读取
-        # 需要确保序列化后的元数据不超过预设的 self.metadata_slot_bytes
-
-        serialized_metadata = cPickle.dumps(current_metadata)
-
-        # 使用实例变量 self.metadata_slot_bytes 进行比较
+        # 5. 检查元数据大小并写入 ShareableList
         if len(serialized_metadata) > self.metadata_slot_bytes:
-            print(f"Warning: Serialized metadata for model {self.n} (actual size: {len(serialized_metadata)}) "
-                f"is too large for the allocated slot (max size: {self.metadata_slot_bytes})! It will be truncated.")
-            # 截断序列化后的元数据以适应槽位大小
-            serialized_metadata = serialized_metadata[:self.metadata_slot_bytes]
+            self.logger.critical(
+                f"[Push model_id:{current_model_id_for_log}] CRITICAL - Serialized metadata (size: {len(serialized_metadata)}) "
+                f"is LARGER than allocated slot size ({self.metadata_slot_bytes}). "
+                "This WILL CAUSE client-side unpickling errors. Increase metadata_slot_bytes or reduce metadata content."
+            )
+            shm.close() # 清理SHM
+            try: shm.unlink()
+            except: pass
+            return None # 指示推送失败
 
-        # 将可能已截断的元数据写入共享列表
-        self.shared_model_list[idx_in_buffer] = serialized_metadata
+        try:
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] Writing serialized metadata to ShareableList slot {idx_in_buffer}...")
+            self.shared_model_list[idx_in_buffer] = serialized_metadata
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] Metadata written to ShareableList slot {idx_in_buffer}.")
+            
+            # 更新服务器本地的 model_list (用于追踪 SHM 对象以便清理)
+            self.model_list[idx_in_buffer] = current_metadata.copy() # 存储元数据副本
+            self.model_list[idx_in_buffer]['memory'] = shm # 存储 SharedMemory 对象本身
+            
+            # 更新全局模型计数器 (self.n 是下一个模型的ID，也是当前推送完成后的模型总数)
+            self.n += 1 
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] Updating total model count in ShareableList to {self.n}...")
+            self.shared_model_list[-1] = self.n # 将新的总数写入共享列表
+            self.logger.info(f"[Push model_id:{current_model_id_for_log}] Successfully pushed. New total models: {self.n}. SHM: {shm.name}, Slot: {idx_in_buffer}.")
         
-        # 更新已推送模型的总数，并将其写入 ShareableList 的最后一个元素
-        self.n += 1
-        self.shared_model_list[-1] = self.n
+        except Exception as e_sl_write:
+            self.logger.critical(f"[Push model_id:{current_model_id_for_log}] CRITICAL - Error writing to ShareableList or updating count: {e_sl_write}", exc_info=True)
+            # 如果写入 ShareableList 失败，相关的 SHM 段也应该被清理
+            shm.close()
+            try: shm.unlink()
+            except: pass
+            self.model_list[idx_in_buffer] = None # 清除本地追踪
+            # self.n 此时不应增加，因为推送未完全成功
+            # (如果 self.n 已经在上面增加了，需要考虑是否回滚，但这里的结构是先写元数据再增加 self.n)
+            # 修正：self.n 应该在所有操作成功后再增加。current_model_id_for_log 已经是 self.n。
+            # 所以在 finally 或成功路径的最后，才将 self.n 更新为 current_model_id_for_log + 1
+            # 为了简单，我们假设如果这里出错，外部调用者（Learner）会知道 push 失败了。
+            return None # 指示推送失败
+
+        object_to_return = self.model_list[idx_in_buffer]
+        self.logger.info(f"[Push model_id:{current_model_id_for_log}] Preparing to return object of type {type(object_to_return)}. Content keys (if dict): {list(object_to_return.keys()) if isinstance(object_to_return, dict) else 'N/A'}")
+        return object_to_return
+
+
+    def cleanup(self):
+        """
+        显式清理所有由该 ModelPoolServer 实例创建和管理的共享内存资源。
+        这个方法应该在程序退出前被调用。
+        """
+        self.logger.info(f"ModelPoolServer '{self.shared_model_list.shm.name if hasattr(self, 'shared_model_list') and self.shared_model_list.shm else 'Unknown'}' cleanup initiated...")
         
-        # print(f"ModelPoolServer: Pushed model {current_metadata['id']} (addr: {current_metadata['_addr']}) to shared_model_list index {idx_in_buffer}. Total models: {self.n}")
-        
-        # 返回包含 SharedMemory 对象的元数据给调用者 (Learner)，虽然 Learner 通常不需要直接操作 shm 对象
-        return self.model_list[idx_in_buffer] 
+        # 1. 清理 ShareableList 本身
+        if hasattr(self, 'shared_model_list') and self.shared_model_list.shm:
+            sl_name = self.shared_model_list.shm.name
+            try:
+                self.shared_model_list.shm.close()
+                self.shared_model_list.shm.unlink()
+                self.logger.info(f"Successfully unlinked ShareableList '{sl_name}'.")
+            except Exception as e:
+                self.logger.error(f"Error unlinking ShareableList '{sl_name}' during cleanup: {e}", exc_info=True)
+        else:
+            self.logger.info("No ShareableList found or it was already unlinked/closed.")
+
+        # 2. 清理所有模型数据占用的 SharedMemory 段
+        if hasattr(self, 'model_list'):
+            for item_idx, item_meta in enumerate(self.model_list):
+                if item_meta and 'memory' in item_meta and isinstance(item_meta['memory'], SharedMemory):
+                    shm_obj_to_clean = item_meta['memory']
+                    model_id_cleaned = item_meta.get('id', f'N/A_at_slot_{item_idx}')
+                    shm_name_to_clean = shm_obj_to_clean.name
+                    self.logger.info(f"Cleaning up SHM for model id {model_id_cleaned}, name {shm_name_to_clean}")
+                    try:
+                        shm_obj_to_clean.close()
+                        shm_obj_to_clean.unlink()
+                        self.logger.debug(f"Successfully unlinked SHM: {shm_name_to_clean} for model id {model_id_cleaned}")
+                    except FileNotFoundError:
+                        self.logger.warning(f"SHM {shm_name_to_clean} for model {model_id_cleaned} was already unlinked or not found during cleanup.")
+                    except Exception as e:
+                        self.logger.error(f"Error cleaning up SHM {shm_name_to_clean} for model {model_id_cleaned} during cleanup: {e}", exc_info=True)
+        self.logger.info(f"ModelPoolServer cleanup attempt finished.")
 
     def __del__(self):
-        """
-        在服务器对象被销毁时，尝试清理所有创建的共享内存块和 ShareableList。
-        """
-        # print("ModelPoolServer is being deleted. Cleaning up shared resources...")
-        # 清理 ShareableList
-        try:
-            self.shared_model_list.shm.close()
-            self.shared_model_list.shm.unlink()
-            # print(f"ModelPoolServer: Unlinked ShareableList '{self.shared_model_list.shm.name}'.")
-        except Exception as e:
-            # print(f"ModelPoolServer: Error unlinking ShareableList: {e}")
-            pass
-
-        # 清理所有模型占用的共享内存
-        for item in self.model_list:
-            if item and 'memory' in item and isinstance(item['memory'], SharedMemory):
-                try:
-                    # print(f"ModelPoolServer: Cleaning up SHM for model id {item.get('id', 'N/A')}, name {item['memory'].name}")
-                    item['memory'].close()
-                    item['memory'].unlink()
-                except FileNotFoundError:
-                    # print(f"ModelPoolServer: SHM {item['memory'].name} already unlinked or not found.")
-                    pass # 可能已经被释放
-                except Exception as e:
-                    # print(f"ModelPoolServer: Error cleaning up SHM {item['memory'].name}: {e}")
-                    pass
-
+        # __del__ 的调用时机不保证，尤其是在进程被信号中断时。
+        # 主要的清理逻辑应该放在显式的 cleanup() 方法中。
+        # 但作为最后一道防线，可以尝试在这里也调用 cleanup。
+        self.logger.debug(f"ModelPoolServer __del__ called. Attempting cleanup if not already done.")
+        if hasattr(self, 'shared_model_list'): # 检查属性是否存在，防止在不完整初始化时出错
+            self.cleanup()
 
 class ModelPoolClient:
     """

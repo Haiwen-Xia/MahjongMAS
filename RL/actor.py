@@ -15,6 +15,8 @@ from model import ResNet34AC                 # Actor 使用的神经网络模型
 from torch.utils.tensorboard import SummaryWriter # 引入 TensorBoard
 from utils import setup_process_logging_and_tensorboard # 用于设置日志和 TensorBoard 的工具函数
 
+import cProfile, pstats # 用于记录效率信息
+
 # Actor 类，继承自 Process，每个 Actor 负责在一个或多个环境中与自身或其他策略进行交互，收集经验数据
 class Actor(Process):
 
@@ -39,6 +41,28 @@ class Actor(Process):
         # 最好在 run() 方法中初始化
         self.logger = None
         self.writer = None
+
+        # 添加 benchmark 模型
+        self.benchmark_models = {}
+        self.benchmark_policy_paths = self.config.get("benchmark_policies", {})
+        for name, path in self.benchmark_policy_paths.items():
+            if os.path.isfile(path):
+                try:
+                    model_instance = ResNet34AC(self.config['in_channels'])
+                    # self._load_state_dict_to_model is a helper you have
+                    state_dict = torch.load(path)
+                    self._load_state_dict_to_model(model_instance, state_dict)
+                    self.benchmark_models[name] = model_instance
+                    # self.logger.info(f"Actor {self.name}: Loaded benchmark policy '{name}' from {path}")
+                except Exception as e:
+                    # self.logger.error(f"Actor {self.name}: Failed to load benchmark policy '{name}' from {path}: {e}", exc_info=True)
+                    pass
+            else:
+                # self.logger.warning(f"Actor {self.name}: Benchmark policy path not found for '{name}': {path}")
+                pass
+
+
+
 
     def _load_state_dict_to_model(self, model_instance, state_dict_to_load):
         """Helper to load state_dict, handling potential nested dicts from checkpoints."""
@@ -145,6 +169,10 @@ class Actor(Process):
         episodes_per_actor_run = self.config.get('episodes_per_actor', 1000) # 总共运行多少局
 
         for episode in range(episodes_per_actor_run):
+            if self.config.get('enable_profiling', False) and episode == 0: # 只 profile 第一个 episode
+                pr = cProfile.Profile()
+                pr.enable()
+
             episode_start_time = time.time()
 
             # --- 1. 定期更新主模型 (model_latest) ---
@@ -163,12 +191,12 @@ class Actor(Process):
                                 is_newer = current_pool_latest_id > latest_model_version_id 
                         
                         if is_newer and current_pool_latest_id != latest_model_version_id: # 避免不必要的加载
-                            self.logger.info(f"Actor {self.name}: Found newer main model ID {current_pool_latest_id} (current: {latest_model_version_id}). Updating model_latest.")
+                            # self.logger.info(f"Actor {self.name}: Found newer main model ID {current_pool_latest_id} (current: {latest_model_version_id}). Updating model_latest.")
                             new_state_dict = model_pool.load_model_parameters(current_pool_latest_meta)
                             if new_state_dict:
                                 self._load_state_dict_to_model(model_latest, new_state_dict)
                                 latest_model_version_id = current_pool_latest_id
-                                self.logger.info(f"Actor {self.name}: Updated model_latest to version {latest_model_version_id}.")
+                                # self.logger.info(f"Actor {self.name}: Updated model_latest to version {latest_model_version_id}.")
                             else:
                                 self.logger.warning(f"Actor {self.name}: Failed to load parameters for new main model ID {current_pool_latest_id}. Continuing with old version.")
                         elif current_pool_latest_id != latest_model_version_id and latest_model_version_id != "N/A":
@@ -181,7 +209,7 @@ class Actor(Process):
             
             # --- 2. 定期决定并设置本轮对局中所有席位的策略 ---
             if episode % opponent_model_change_interval == 0:
-                self.logger.info(f"Actor {self.name}, Episode {episode + 1}: Re-evaluating/setting policies for all seats.")
+                # self.logger.info(f"Actor {self.name}, Episode {episode + 1}: Re-evaluating/setting policies for all seats.")
                 policies.clear()
                 opponent_model_ids.clear() # 清除上一轮的对手ID记录
 
@@ -193,10 +221,31 @@ class Actor(Process):
                     if seat_idx == main_agent_seat_idx_in_env:
                         policies[current_env_agent_name] = model_latest
                         opponent_model_ids[current_env_agent_name] = latest_model_version_id
-                        self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using main learning model (ID: {latest_model_version_id})")
+                        # self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using main learning model (ID: {latest_model_version_id})")
                     else: # 这是对手席位
-                        if np.random.rand() < p_opponent_historical:
-                            self.logger.debug(f"  Seat {seat_idx} ({current_env_agent_name}): Attempting to sample historical opponent (k={opponent_sampling_k}).")
+
+                        use_benchmark_opponent = np.random.rand() < self.config.get('prob_opponent_is_benchmark', 0.0)
+
+                        if use_benchmark_opponent and self.benchmark_models:
+                            # 选择一个基准模型 (可以简单随机选，或按配置的概率选)
+                            # Example: choose 'initial_il_policy' with higher probability
+                            chosen_benchmark_name = None
+                            if 'initial_il_policy' in self.benchmark_models and np.random.rand() < self.config.get('prob_benchmark_is_initial_il', 1.0):
+                                chosen_benchmark_name = 'initial_il_policy'
+                            else: # Fallback to random benchmark or other logic
+                                available_benchmarks = list(self.benchmark_models.keys())
+                                if available_benchmarks:
+                                    chosen_benchmark_name = np.random.choice(available_benchmarks)
+
+                            if chosen_benchmark_name:
+                                policies[current_env_agent_name] = self.benchmark_models[chosen_benchmark_name]
+                                opponent_model_ids[current_env_agent_name] = f"benchmark_{chosen_benchmark_name}"
+                                # self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using BENCHMARK model '{chosen_benchmark_name}'")
+                            else: # Should not happen if self.benchmark_models is not empty
+                                use_benchmark_opponent = False # Fallback to pool/latest
+
+                        elif np.random.rand() < p_opponent_historical:
+                            # self.logger.debug(f"  Seat {seat_idx} ({current_env_agent_name}): Attempting to sample historical opponent (k={opponent_sampling_k}).")
                             exclude_ids_list = [latest_model_version_id] if latest_model_version_id != "N/A" else None
                             
                             sampled_meta = model_pool.sample_model_metadata(
@@ -213,12 +262,12 @@ class Actor(Process):
                                 if params:
                                     if current_env_agent_name not in opponent_model_instances:
                                         opponent_model_instances[current_env_agent_name] = ResNet34AC(self.config['in_channels'])
-                                        self.logger.info(f"    Created new model instance for opponent {current_env_agent_name}")
+                                        # self.logger.info(f"    Created new model instance for opponent {current_env_agent_name}")
                                     
                                     self._load_state_dict_to_model(opponent_model_instances[current_env_agent_name], params)
                                     policies[current_env_agent_name] = opponent_model_instances[current_env_agent_name]
                                     opponent_model_ids[current_env_agent_name] = sampled_id
-                                    self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using sampled historical model (ID: {sampled_id})")
+                                    # self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using sampled historical model (ID: {sampled_id})")
                                     historical_model_loaded_successfully = True
                                 else:
                                     self.logger.warning(f"    Failed to load params for sampled ID {sampled_id}.")
@@ -230,15 +279,15 @@ class Actor(Process):
                                 policies[current_env_agent_name] = model_latest 
                                 opponent_model_ids[current_env_agent_name] = latest_model_version_id
                         else:
-                            self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using main learning model (ID: {latest_model_version_id}) as opponent.")
+                            # self.logger.info(f"  Seat {seat_idx} ({current_env_agent_name}): Using main learning model (ID: {latest_model_version_id}) as opponent.")
                             policies[current_env_agent_name] = model_latest
                             opponent_model_ids[current_env_agent_name] = latest_model_version_id
             
             # --- 运行一个 episode 并收集数据 ---
-            self.logger.info(f"Actor {self.name}, Ep {episode+1}/{episodes_per_actor_run}. P1={latest_model_version_id}, "
-                             f"P2={opponent_model_ids.get(env.agent_names[1], 'N/A')}, "
-                             f"P3={opponent_model_ids.get(env.agent_names[2], 'N/A')}, "
-                             f"P4={opponent_model_ids.get(env.agent_names[3], 'N/A')}")
+            # self.logger.info(f"Actor {self.name}, Ep {episode+1}/{episodes_per_actor_run}. P1={latest_model_version_id}, "
+            #                  f"P2={opponent_model_ids.get(env.agent_names[1], 'N/A')}, "
+            #                  f"P3={opponent_model_ids.get(env.agent_names[2], 'N/A')}, "
+            #                  f"P4={opponent_model_ids.get(env.agent_names[3], 'N/A')}")
 
             try: 
                 obs = env.reset() 
@@ -377,10 +426,69 @@ class Actor(Process):
 
             # --- Episode 结束 ---
             episode_duration = time.time() - episode_start_time
+            episode_transformed_rewards = {agent_name: 0.0 for agent_name in env.agent_names}
 
-            lastest_model_reward = episode_raw_rewards[main_agent_name]
+            if self.config['use_normalized_reward']:
+                self.logger.info(f"Episode {episode+1}: Applying reward normalization/transformation.")
+                
+                # 1. 从 episode_raw_rewards 获取所有玩家的原始最终得分
+                #    env.agent_names 提供了标准的玩家顺序，例如 ['player_0', 'player_1', 'player_2', 'player_3']
+                #    我们需要确保得到所有4个玩家的得分，即使某个玩家可能因为某种原因没有分数记录 (默认为0)
+                
+                # 检查 env.agent_names 是否包含4个玩家
+                if len(env.agent_names) != 4:
+                    self.logger.error(f"Reward normalization expects 4 players, but found {len(env.agent_names)}. Skipping normalization.")
+                else:
+                    raw_scores_ordered_list = [episode_raw_rewards.get(name, 0.0) for name in env.agent_names]
+                    self.logger.debug(f"  Raw scores for normalization: {list(zip(env.agent_names, raw_scores_ordered_list))}")
+
+                    transformed_scores_ordered_list = [0.0] * 4
+                    
+                    min_raw_score = min(raw_scores_ordered_list)
+                    min_raw_score_count = raw_scores_ordered_list.count(min_raw_score)
+
+                    for idx, raw_score in enumerate(raw_scores_ordered_list):
+                        if raw_score > 0:
+                            transformed_scores_ordered_list[idx] = np.sqrt(raw_score / 2.0)
+                        elif raw_score < 0:
+                            # 检查是否是唯一的严格最小负分 (点炮者)
+                            if raw_score == min_raw_score and min_raw_score_count == 1:
+                                transformed_scores_ordered_list[idx] = -2.0
+                            else: # 其他负分玩家
+                                transformed_scores_ordered_list[idx] = -1.0
+                        else: # raw_score == 0
+                            transformed_scores_ordered_list[idx] = 0.0
+                    
+                    self.logger.debug(f"  Transformed scores: {list(zip(env.agent_names, transformed_scores_ordered_list))}")
+
+
+                    for idx, agent_name_key in enumerate(env.agent_names):
+                        episode_transformed_rewards[agent_name_key] = transformed_scores_ordered_list[idx]
+
+                    # 2. 更新 episode_data 中每个玩家的奖励序列
+                    #    假设：只有奖励序列的最后一个元素代表该局的最终得分，之前都是0。
+                    #    如果您的 env.step() 会在中间步骤返回非零奖励，这里的逻辑需要调整。
+                    for idx, agent_name_key in enumerate(env.agent_names):
+                        if agent_name_key in episode_data:
+                            agent_reward_list = episode_data[agent_name_key]['reward']
+                            if agent_reward_list: # 确保奖励列表不为空 (即该玩家有记录的步骤)
+                                # 替换最后一个元素为变换后的得分
+                                # 这假设了原始的最终得分已经被正确地作为最后一个元素添加到了这个列表
+                                original_terminal_reward = agent_reward_list[-1] # 用于日志
+                                agent_reward_list[-1] = transformed_scores_ordered_list[idx]
+                                self.logger.debug(f"  Updated terminal reward for {agent_name_key}: {original_terminal_reward} -> {transformed_scores_ordered_list[idx]}")
+                            elif len(agent_data_proc.get('action', [])) > 0 : # 有动作但奖励列表为空，这不应该发生
+                                 self.logger.warning(f"  Agent {agent_name_key} has actions but reward list is empty. Cannot apply normalized terminal reward.")
+                        else:
+                            # 如果某个 agent_name 不在 episode_data 中 (例如，因为过滤或从未行动)
+                            # 则无需操作。GAE 计算只会处理 episode_data 中存在的 agent。
+                            pass 
+            else:
+                episode_transformed_rewards = episode_raw_rewards
+
+            lastest_model_reward = episode_transformed_rewards[main_agent_name]
             self.logger.info(f"Episode {episode+1} finished in {step_count} steps ({episode_duration:.2f}s). "
-                        f"Model Version {latest_model_version_id}. Latest Model Raw Reward: {lastest_model_reward:.2f}.")
+                        f"Model Version {latest_model_version_id}. Latest Model Reward: {lastest_model_reward:.2f}.")
             
             
             # --- 记录到 TensorBoard ---
@@ -391,7 +499,7 @@ class Actor(Process):
                      self.writer.add_scalar('Reward/LastestModel', lastest_model_reward, episode + 1)
                      self.writer.add_scalar('Episode/Length', step_count, episode + 1)
                      # 可以记录每个 agent 的奖励
-                     for agent_id, total_reward in episode_raw_rewards.items():
+                     for agent_id, total_reward in episode_transformed_rewards.items():
                           self.writer.add_scalar(f'Reward/Agent_{agent_id}_EpisodeTotal', total_reward, episode + 1)
                      self.writer.flush() # 确保写入
                 except Exception as e:
@@ -468,6 +576,15 @@ class Actor(Process):
                     # logger.debug(f"Pushed {T} steps of data for {agent_name} to replay buffer.") # Debug level log
                 except Exception as e:
                      self.logger.error(f"Error pushing data to replay buffer for {agent_name}: {e}")
+
+            if self.config.get('enable_profiling', False) and episode == 0:
+                pr.disable()
+                ps = pstats.Stats(pr).sort_stats('cumulative')
+                profile_log_path = os.path.join(self.config['log_base_dir'], 'file_logs', self.config['experiment_name'], f"{self.name}_profile.log")
+                with open(profile_log_path, 'w') as f_profile:
+                    ps_profile = pstats.Stats(pr, stream=f_profile).sort_stats('cumulative')
+                    ps_profile.print_stats(30) # 打印耗时最多的30个函数
+                self.logger.info(f"Profile results saved to {profile_log_path}")
 
         # --- Actor 结束 ---
         self.logger.info(f"Finished {self.config['episodes_per_actor']} episodes. Exiting.")

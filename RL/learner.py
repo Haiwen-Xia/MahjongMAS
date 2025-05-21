@@ -12,6 +12,8 @@ import json # 用于打印配置
 from utils import calculate_scheduled_lr # 导入动态学习率计算函数
 from utils import setup_process_logging_and_tensorboard # 导入日志和 TensorBoard 设置函数
 
+import signal # 用于异常处理时 gracefully exit
+import sys # 用于 sys.exit
 
 # 导入自定义模块
 from replay_buffer import ReplayBuffer      # 经验回放缓冲区，用于存储 Actor 收集的数据并供 Learner 采样
@@ -40,6 +42,44 @@ class Learner(Process):
         self.logger = None # 初始化日志记录器为 None
         self.writer = None # 初始化 TensorBoard writer 为 None
         self.model = None # Initialize model attribute
+
+        self.model_pool_server_instance = None # 添加一个属性来持有 ModelPoolServer 实例
+        self.shutting_down = False # 信号处理标志
+
+
+    def _signal_handler(self, signum, frame):
+        """处理终止信号，确保资源被清理。"""
+        if self.shutting_down: # 防止重入
+            return
+        self.shutting_down = True
+
+        signal_name = signal.Signals(signum).name
+        self.logger.warning(f"Learner process {self.name} (PID: {os.getpid()}) received signal {signal_name} ({signum}). Initiating graceful shutdown...")
+        
+        # 1. 清理 ModelPoolServer (如果它是由 Learner 创建和拥有的)
+        if self.model_pool_server_instance:
+            self.logger.info("Learner attempting to cleanup ModelPoolServer...")
+            try:
+                self.model_pool_server_instance.cleanup() # 调用显式的清理方法
+            except Exception as e_cleanup:
+                self.logger.error(f"Error during ModelPoolServer cleanup in signal handler: {e_cleanup}", exc_info=True)
+        
+        # 2. 关闭 TensorBoard writer (如果存在)
+        if self.writer:
+            self.logger.info("Learner closing TensorBoard writer...")
+            try:
+                self.writer.close()
+            except Exception as e_writer:
+                self.logger.error(f"Error closing TensorBoard writer in signal handler: {e_writer}", exc_info=True)
+
+        self.logger.info(f"Learner {self.name} shutdown tasks complete. Exiting via signal handler.")
+        # 在信号处理器中，通常建议重新抛出信号或以相应的退出码退出
+        # sys.exit(128 + signum) # 常见的退出码约定
+        # 或者，如果希望Python的默认信号处理（如打印KeyboardInterrupt）发生：
+        # signal.signal(signum, signal.SIG_DFL) # 恢复默认处理器
+        # os.kill(os.getpid(), signum) # 重新发送信号给自己
+        # 简单起见，可以直接退出，但可能不会打印标准 KeyboardInterrupt 消息
+        sys.exit(0) # 或者一个表示异常终止的非零退出码
 
     def _set_requires_grad(self, module, requires_grad):
         """Helper function to set requires_grad for all parameters of a module."""
@@ -72,6 +112,25 @@ class Learner(Process):
         8. 定期保存模型检查点。
         9. 记录日志和 TensorBoard 指标。
         """
+
+    def run(self):
+
+
+        # --- 设置信号处理器 ---
+        # 通常在进程的主要执行逻辑开始时设置
+        # 注意：在 Windows 上，signal.SIGINT 可能只能被主线程捕获。
+        # 对于多进程，更通用的方式可能是在主进程中捕获，然后通知子进程。
+        # 但如果 Learner 是主导 ModelPoolServer 的进程，它自身处理信号是合理的。
+        original_sigint_handler = signal.getsignal(signal.SIGINT)
+        original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+        try:
+            signal.signal(signal.SIGINT, self._signal_handler)  # Ctrl+C
+            signal.signal(signal.SIGTERM, self._signal_handler) # kill 命令
+        except ValueError as e_signal: # 例如在非主线程中设置 SIGINT 可能会失败
+            print(f"Warning: Could not set signal handlers for Learner: {e_signal}")
+            # self.logger 可能还未初始化，所以用 print
+
+
         # --- 1. 初始化日志和 TensorBoard ---
         log_base_dir = self.config.get('log_base_dir', './logs') 
         experiment_name = self.config.get('experiment_name', 'default_run')
@@ -87,473 +146,542 @@ class Learner(Process):
 
         # --- 2. 初始化模型池服务器 ---
         try:
-            model_pool = ModelPoolServer(self.config['model_pool_size'], self.config['model_pool_name'])
-            self.logger.info(f"Model Pool Server '{self.config['model_pool_name']}' initialized with size {self.config['model_pool_size']}.")
+            model_pool_name = self.config.get('model_pool_name')
+            if not model_pool_name:
+                self.logger.critical("Config 'model_pool_name' is not set. Learner exiting.")
+                # 在 finally 中恢复原始信号处理器并退出
+                signal.signal(signal.SIGINT, original_sigint_handler)
+                signal.signal(signal.SIGTERM, original_sigterm_handler)
+                return
+            self.model_pool_server_instance = ModelPoolServer(self.config['model_pool_size'], model_pool_name)
+            # model_pool 变量现在也指向这个实例，方便后续代码使用
+            model_pool = self.model_pool_server_instance 
+            self.logger.info(f"Model Pool Server '{model_pool_name}' initialized with size {self.config['model_pool_size']}.")
         except Exception as e:
-            self.logger.error(f"Failed to initialize Model Pool Server: {e}. Learner exiting.", exc_info=True)
+            self.logger.critical(f"Failed to initialize Model Pool Server: {e}. Learner exiting.", exc_info=True)
             if self.writer: self.writer.close()
+            signal.signal(signal.SIGINT, original_sigint_handler)
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
             return
 
-        # --- 3. 初始化模型 ---
-        device = torch.device(self.config['device'])
-        self.logger.info(f"Learner using device: {device}")
-        self.logger.info("Creating RL model (ResNet34AC with separate FEs)...")
+        # 后续逻辑全部放在 try 中, 使得我们手动终止程序时会自动清理 ModelPoolServer 实例
+
         try:
-            self.model = ResNet34AC(in_channels=self.config['in_channels']) 
-        except Exception as e:
-            self.logger.error(f"Failed to create RL model instance: {e}. Learner exiting.", exc_info=True)
-            if self.writer: self.writer.close()
-            return
-
-        # --- 3.1 (可选) 加载监督学习 (IL) 预训练权重到 Actor 相关组件 ---
-        sl_model_path = self.config.get('supervised_model_path')
-        sl_actor_fe_weights_loaded = False 
-        sl_actor_head_weights_loaded = False
-
-        if sl_model_path and os.path.isfile(sl_model_path):
-            self.logger.info(f"Attempting to load pre-trained SL weights from: {sl_model_path} for Actor components.")
+            # --- 3. 初始化模型 ---
+            device = torch.device(self.config['device'])
+            self.logger.info(f"Learner using device: {device}")
+            self.logger.info("Creating RL model (ResNet34AC with separate FEs)...")
             try:
-                sl_state_dict = torch.load(sl_model_path, map_location='cpu')
-                self.logger.info(f"Successfully loaded supervised state_dict from {sl_model_path} (contains {len(sl_state_dict)} tensors).")
-                                
-                if not hasattr(self.model, 'feature_extractor_actor'):
-                    self.logger.error("RL Model structure error: 'feature_extractor_actor' not found.")
-                if not hasattr(self.model, 'actor_head'):
-                    self.logger.error("RL Model structure error: 'actor_head' not found.")
-
-                new_rl_state_dict = self.model.state_dict()
-                loaded_keys_count_fe = 0
-                loaded_keys_count_head = 0
-
-                for sl_key_name, sl_param_tensor in sl_state_dict.items():
-                    rl_target_key_name = None
-                    
-                    if sl_key_name.startswith('feature_extractor.'):
-                        if hasattr(self.model, 'feature_extractor_actor'):
-                            rl_target_key_name = sl_key_name.replace('feature_extractor.', 'feature_extractor_actor.', 1)
-                            if rl_target_key_name in new_rl_state_dict and new_rl_state_dict[rl_target_key_name].shape == sl_param_tensor.shape:
-                                new_rl_state_dict[rl_target_key_name] = sl_param_tensor
-                                sl_actor_fe_weights_loaded = True
-                                loaded_keys_count_fe +=1
-                    elif sl_key_name.startswith('fc.'): 
-                        if hasattr(self.model, 'actor_head'):
-                            rl_target_key_name = sl_key_name.replace('fc.', 'actor_head.', 1)
-                            if rl_target_key_name in new_rl_state_dict and new_rl_state_dict[rl_target_key_name].shape == sl_param_tensor.shape:
-                                new_rl_state_dict[rl_target_key_name] = sl_param_tensor
-                                sl_actor_head_weights_loaded = True
-                                loaded_keys_count_head += 1
-                
-                if sl_actor_fe_weights_loaded or sl_actor_head_weights_loaded:
-                    self.model.load_state_dict(new_rl_state_dict)
-                    if sl_actor_fe_weights_loaded:
-                        self.logger.info(f"Successfully loaded {loaded_keys_count_fe} tensors into 'feature_extractor_actor' from SL model.")
-                    if sl_actor_head_weights_loaded:
-                         self.logger.info(f"Successfully loaded {loaded_keys_count_head} tensors into 'actor_head' from SL model.")
-                else:
-                    self.logger.warning("No SL weights were matched or loaded into actor components (feature_extractor_actor, actor_head).")
-
-                if hasattr(self.model, 'feature_extractor_actor') and not sl_actor_fe_weights_loaded :
-                     self.logger.warning("Could not load any weights into 'feature_extractor_actor'. Check SL model keys/shapes (e.g. 'feature_extractor.*').")
-                if hasattr(self.model, 'actor_head') and not sl_actor_head_weights_loaded:
-                     self.logger.warning("Could not load any weights into 'actor_head'. Check SL model keys/shapes (e.g. 'fc.*').")
+                self.model = ResNet34AC(in_channels=self.config['in_channels']) 
             except Exception as e:
-                self.logger.error(f"Failed during loading or processing SL weights for Actor components: {e}. "
-                                  "Actor components will use random initialization or current state.", exc_info=True)
-                sl_actor_fe_weights_loaded = False 
-                sl_actor_head_weights_loaded = False
-        else: 
-            if sl_model_path: 
-                self.logger.warning(f"Supervised model path specified ('{sl_model_path}') but not found. "
-                                    "Actor components will use random initialization.")
+                self.logger.error(f"Failed to create RL model instance: {e}. Learner exiting.", exc_info=True)
+                if self.writer: self.writer.close()
+                return
+
+            # --- 3.1 (可选) 加载监督学习 (IL) 预训练权重到 Actor 相关组件 ---
+            sl_model_path = self.config.get('supervised_model_path')
+            sl_actor_fe_weights_loaded = False 
+            sl_actor_head_weights_loaded = False
+
+            if sl_model_path and os.path.isfile(sl_model_path):
+                self.logger.info(f"Attempting to load pre-trained SL weights from: {sl_model_path} for Actor components.")
+                try:
+                    sl_state_dict = torch.load(sl_model_path, map_location='cpu')
+                    self.logger.info(f"Successfully loaded supervised state_dict from {sl_model_path} (contains {len(sl_state_dict)} tensors).")
+                                    
+                    if not hasattr(self.model, 'feature_extractor_actor'):
+                        self.logger.error("RL Model structure error: 'feature_extractor_actor' not found.")
+                    if not hasattr(self.model, 'actor_head'):
+                        self.logger.error("RL Model structure error: 'actor_head' not found.")
+
+                    new_rl_state_dict = self.model.state_dict()
+                    loaded_keys_count_fe = 0
+                    loaded_keys_count_head = 0
+
+                    for sl_key_name, sl_param_tensor in sl_state_dict.items():
+                        rl_target_key_name = None
+                        
+                        if sl_key_name.startswith('feature_extractor.'):
+                            if hasattr(self.model, 'feature_extractor_actor'):
+                                rl_target_key_name = sl_key_name.replace('feature_extractor.', 'feature_extractor_actor.', 1)
+                                if rl_target_key_name in new_rl_state_dict and new_rl_state_dict[rl_target_key_name].shape == sl_param_tensor.shape:
+                                    new_rl_state_dict[rl_target_key_name] = sl_param_tensor
+                                    sl_actor_fe_weights_loaded = True
+                                    loaded_keys_count_fe +=1
+                        elif sl_key_name.startswith('fc.'): 
+                            if hasattr(self.model, 'actor_head'):
+                                rl_target_key_name = sl_key_name.replace('fc.', 'actor_head.', 1)
+                                if rl_target_key_name in new_rl_state_dict and new_rl_state_dict[rl_target_key_name].shape == sl_param_tensor.shape:
+                                    new_rl_state_dict[rl_target_key_name] = sl_param_tensor
+                                    sl_actor_head_weights_loaded = True
+                                    loaded_keys_count_head += 1
+                    
+                    if sl_actor_fe_weights_loaded or sl_actor_head_weights_loaded:
+                        self.model.load_state_dict(new_rl_state_dict)
+                        if sl_actor_fe_weights_loaded:
+                            self.logger.info(f"Successfully loaded {loaded_keys_count_fe} tensors into 'feature_extractor_actor' from SL model.")
+                        if sl_actor_head_weights_loaded:
+                            self.logger.info(f"Successfully loaded {loaded_keys_count_head} tensors into 'actor_head' from SL model.")
+                    else:
+                        self.logger.warning("No SL weights were matched or loaded into actor components (feature_extractor_actor, actor_head).")
+
+                    if hasattr(self.model, 'feature_extractor_actor') and not sl_actor_fe_weights_loaded :
+                        self.logger.warning("Could not load any weights into 'feature_extractor_actor'. Check SL model keys/shapes (e.g. 'feature_extractor.*').")
+                    if hasattr(self.model, 'actor_head') and not sl_actor_head_weights_loaded:
+                        self.logger.warning("Could not load any weights into 'actor_head'. Check SL model keys/shapes (e.g. 'fc.*').")
+                except Exception as e:
+                    self.logger.error(f"Failed during loading or processing SL weights for Actor components: {e}. "
+                                    "Actor components will use random initialization or current state.", exc_info=True)
+                    sl_actor_fe_weights_loaded = False 
+                    sl_actor_head_weights_loaded = False
             else: 
-                self.logger.info("No supervised model path provided. Actor components (feature_extractor_actor, actor_head) "
-                                 "will use random initialization.")
+                if sl_model_path: 
+                    self.logger.warning(f"Supervised model path specified ('{sl_model_path}') but not found. "
+                                        "Actor components will use random initialization.")
+                else: 
+                    self.logger.info("No supervised model path provided. Actor components (feature_extractor_actor, actor_head) "
+                                    "will use random initialization.")
 
-        self.logger.info("Initializing feature_extractor_critic...")
-        try:
-            if hasattr(self.model, 'feature_extractor_actor') and hasattr(self.model, 'feature_extractor_critic'):
-                actor_fe_state_dict = self.model.feature_extractor_actor.state_dict()
-                self.model.feature_extractor_critic.load_state_dict(actor_fe_state_dict)
-                source_description = "from SL-trained feature_extractor_actor" if sl_actor_fe_weights_loaded else \
-                                     "from randomly initialized (or SL-load-attempted) feature_extractor_actor"
-                self.logger.info(f"Successfully initialized feature_extractor_critic with weights {source_description}.")
-            else:
-                self.logger.error("Cannot initialize feature_extractor_critic: 'feature_extractor_actor' or "
-                                  "'feature_extractor_critic' not found in the model structure.")
-        except Exception as e:
-            self.logger.error(f"Error during initialization of feature_extractor_critic from feature_extractor_actor: {e}", exc_info=True)
-        
-        self.logger.info("Critic_head will use its default (random) initialization.")
-        self.model.to(device)
-        self.logger.info(f"RL model (ResNet34AC) moved to device: {device}")
-
-        # --- 3.2 参数冻结 (根据配置) ---
-        # Critic head is always trainable from start to learn value function.
-        if hasattr(self.model, 'critic_head'):
-            self._set_requires_grad(self.model.critic_head, True)
-        else:
-            self.logger.error("Model has no 'critic_head'.")
-
-        # Actor Head freezing logic
-        unfreeze_actor_head_after_iters = self.config.get('unfreeze_actor_head_after_iters', 0)
-        if hasattr(self.model, 'actor_head'):
-            if unfreeze_actor_head_after_iters > 0:
-                self._set_requires_grad(self.model.actor_head, False) # Freeze if unfreeze_iters > 0
-            else:
-                self._set_requires_grad(self.model.actor_head, True)  # Trainable from start
-        else:
-            self.logger.error("Model has no 'actor_head' for freezing logic.")
-
-        # Actor Feature Extractor freezing logic
-        # Critic Feature Extractor will use the SAME unfreeze iteration and logic as Actor Feature Extractor
-        unfreeze_actor_fe_after_iters = self.config.get('unfreeze_actor_feature_extractor_after_iters', 0)
-
-        if hasattr(self.model, 'feature_extractor_actor'):
-            if unfreeze_actor_fe_after_iters > 0:
-                self._set_requires_grad(self.model.feature_extractor_actor, False) # Freeze if unfreeze_iters > 0
-            else:
-                self._set_requires_grad(self.model.feature_extractor_actor, True)  # Trainable from start
-        else:
-            self.logger.error("Model has no 'feature_extractor_actor' for freezing logic.")
-
-        # MODIFICATION: Critic Feature Extractor freezing logic (tied to actor_fe)
-        if hasattr(self.model, 'feature_extractor_critic'):
-            if unfreeze_actor_fe_after_iters > 0: # Use same condition as actor_fe
-                self._set_requires_grad(self.model.feature_extractor_critic, False) # Initially FROZEN
-            else:
-                self._set_requires_grad(self.model.feature_extractor_critic, True)  # Trainable from start if actor_fe is
-        else:
-            self.logger.error("Model has no 'feature_extractor_critic' for freezing logic.")
-        # MODIFICATION END
-
-        # --- 4. 初始化优化器 (支持差分学习率和冻结) ---
-        lr_critic_head = self.config.get('lr_critic_head', self.config.get('lr', 3e-4)) 
-        lr_critic_fe = self.config.get('lr_critic_feature_extractor', lr_critic_head) 
-        lr_actor_head = self.config.get('lr_actor_head_finetune', 3e-5)
-        lr_actor_fe = self.config.get('lr_actor_feature_extractor_finetune', 1e-5)
-
-        param_groups = []
-        if hasattr(self.model, 'critic_head'):
-            param_groups.append({'params': self.model.critic_head.parameters(), 'lr': lr_critic_head, 'name': 'critic_head'})
-        if hasattr(self.model, 'feature_extractor_critic'):
-            param_groups.append({'params': self.model.feature_extractor_critic.parameters(), 'lr': lr_critic_fe, 'name': 'critic_fe'})
-        if hasattr(self.model, 'actor_head'):
-            param_groups.append({'params': self.model.actor_head.parameters(), 'lr': lr_actor_head, 'name': 'actor_head'})
-        if hasattr(self.model, 'feature_extractor_actor'):
-            param_groups.append({'params': self.model.feature_extractor_actor.parameters(), 'lr': lr_actor_fe, 'name': 'actor_fe'})
-        
-        if not param_groups:
-            self.logger.error("No parameter groups created for the optimizer. Check model attributes. Learner exiting.")
-            if self.writer: self.writer.close()
-            return
-
-        optimizer = torch.optim.Adam(param_groups)
-        self.logger.info(f"Optimizer initialized with parameter groups:")
-        for pg_idx, pg in enumerate(optimizer.param_groups):
-            num_params_total = sum(p.numel() for p in pg['params'])
-            num_params_trainable = sum(p.numel() for p in pg['params'] if p.requires_grad) 
-            self.logger.info(f"  Group {pg_idx} ('{pg.get('name', 'Unnamed')}'): LR={pg['lr']:.2e}, Trainable_Params={num_params_trainable}/{num_params_total}")
-
-        # --- 4.1 推送初始模型到模型池 ---
-        try:
-            initial_model_state_dict = self.model.to('cpu').state_dict()
-            self.model.to(device) 
-            initial_version_info = model_pool.push(initial_model_state_dict)
-            initial_version_id = initial_version_info.get('id', 'N/A') if initial_version_info else 'N/A'
-            self.logger.info(f"Pushed initial model version {initial_version_id} to Model Pool.")
-        except Exception as e:
-            self.logger.error(f"Failed to push initial model: {e}. Learner exiting.", exc_info=True)
-            if self.writer: self.writer.close()
-            self.model.to(device) 
-            return
+            self.logger.info("Initializing feature_extractor_critic...")
+            try:
+                if hasattr(self.model, 'feature_extractor_actor') and hasattr(self.model, 'feature_extractor_critic'):
+                    actor_fe_state_dict = self.model.feature_extractor_actor.state_dict()
+                    self.model.feature_extractor_critic.load_state_dict(actor_fe_state_dict)
+                    source_description = "from SL-trained feature_extractor_actor" if sl_actor_fe_weights_loaded else \
+                                        "from randomly initialized (or SL-load-attempted) feature_extractor_actor"
+                    self.logger.info(f"Successfully initialized feature_extractor_critic with weights {source_description}.")
+                else:
+                    self.logger.error("Cannot initialize feature_extractor_critic: 'feature_extractor_actor' or "
+                                    "'feature_extractor_critic' not found in the model structure.")
+            except Exception as e:
+                self.logger.error(f"Error during initialization of feature_extractor_critic from feature_extractor_actor: {e}", exc_info=True)
             
-        # --- 5. 初始化学习率调度器参数 ---
-        base_lr_for_scheduler = lr_critic_head 
-        use_lr_scheduler = self.config.get('use_lr_scheduler', False)
-        if use_lr_scheduler:
-            warmup_iterations = self.config.get('warmup_iterations', 1000) 
-            total_iterations_for_lr_decay = self.config.get('total_iterations_for_lr_decay', 500000) 
-            min_lr_scheduler_critic = self.config.get('min_lr_critic_schedule', 1e-6) 
-            initial_lr_for_warmup_critic = self.config.get('initial_lr_warmup_critic', base_lr_for_scheduler * 0.01)
+            self.logger.info("Critic_head will use its default (random) initialization.")
+            self.model.to(device)
+            self.logger.info(f"RL model (ResNet34AC) moved to device: {device}")
+
+            # --- 3.2 参数冻结 (根据配置) ---
+            # Critic head is always trainable from start to learn value function.
+            if hasattr(self.model, 'critic_head'):
+                self._set_requires_grad(self.model.critic_head, True)
+            else:
+                self.logger.error("Model has no 'critic_head'.")
+
+            # Actor Head freezing logic
+            unfreeze_actor_head_after_iters = self.config.get('unfreeze_actor_head_after_iters', 0)
+            if hasattr(self.model, 'actor_head'):
+                if unfreeze_actor_head_after_iters > 0:
+                    self._set_requires_grad(self.model.actor_head, False) # Freeze if unfreeze_iters > 0
+                else:
+                    self._set_requires_grad(self.model.actor_head, True)  # Trainable from start
+            else:
+                self.logger.error("Model has no 'actor_head' for freezing logic.")
+
+            # Actor Feature Extractor freezing logic
+            # Critic Feature Extractor will use the SAME unfreeze iteration and logic as Actor Feature Extractor
+            unfreeze_actor_fe_after_iters = self.config.get('unfreeze_actor_feature_extractor_after_iters', 0)
+
+            if hasattr(self.model, 'feature_extractor_actor'):
+                if unfreeze_actor_fe_after_iters > 0:
+                    self._set_requires_grad(self.model.feature_extractor_actor, False) # Freeze if unfreeze_iters > 0
+                else:
+                    self._set_requires_grad(self.model.feature_extractor_actor, True)  # Trainable from start
+            else:
+                self.logger.error("Model has no 'feature_extractor_actor' for freezing logic.")
+
+            # MODIFICATION: Critic Feature Extractor freezing logic (tied to actor_fe)
+            if hasattr(self.model, 'feature_extractor_critic'):
+                if unfreeze_actor_fe_after_iters > 0: # Use same condition as actor_fe
+                    self._set_requires_grad(self.model.feature_extractor_critic, False) # Initially FROZEN
+                else:
+                    self._set_requires_grad(self.model.feature_extractor_critic, True)  # Trainable from start if actor_fe is
+            else:
+                self.logger.error("Model has no 'feature_extractor_critic' for freezing logic.")
+            # MODIFICATION END
+
+            # --- 4. 初始化优化器 (支持差分学习率和冻结) ---
+            lr_critic_head = self.config.get('lr_critic_head', self.config.get('lr', 3e-4)) 
+            lr_critic_fe = self.config.get('lr_critic_feature_extractor', lr_critic_head) 
+            lr_actor_head = self.config.get('lr_actor_head_finetune', 3e-5)
+            lr_actor_fe = self.config.get('lr_actor_feature_extractor_finetune', 1e-5)
+
+            param_groups = []
+            if hasattr(self.model, 'critic_head'):
+                param_groups.append({'params': self.model.critic_head.parameters(), 'lr': lr_critic_head, 'name': 'critic_head'})
+            if hasattr(self.model, 'feature_extractor_critic'):
+                param_groups.append({'params': self.model.feature_extractor_critic.parameters(), 'lr': lr_critic_fe, 'name': 'critic_fe'})
+            if hasattr(self.model, 'actor_head'):
+                param_groups.append({'params': self.model.actor_head.parameters(), 'lr': lr_actor_head, 'name': 'actor_head'})
+            if hasattr(self.model, 'feature_extractor_actor'):
+                param_groups.append({'params': self.model.feature_extractor_actor.parameters(), 'lr': lr_actor_fe, 'name': 'actor_fe'})
             
-            self.logger.info(f"LR Scheduler enabled for Critic Head AND Critic FE. Both will follow the same schedule derived from Critic Head's settings:")
-            self.logger.info(f"  Schedule: Linear Warmup ({warmup_iterations} iters, from {initial_lr_for_warmup_critic:.2e} to {base_lr_for_scheduler:.2e}) "
-                             f"then Cosine Decay ({total_iterations_for_lr_decay} iters to {min_lr_scheduler_critic:.2e}).")
-            self.logger.info(f"  Initial LRs for Actor components (fixed unless scheduled separately, and may be initially frozen): "
-                             f"ActorHead={lr_actor_head:.2e}, ActorFE={lr_actor_fe:.2e}")
-        else:
-            self.logger.info(f"LR Scheduler disabled. Using fixed LRs for all components based on initial optimizer settings.")
+            if not param_groups:
+                self.logger.error("No parameter groups created for the optimizer. Check model attributes. Learner exiting.")
+                if self.writer: self.writer.close()
+                return
 
+            optimizer = torch.optim.Adam(param_groups)
+            self.logger.info(f"Optimizer initialized with parameter groups:")
+            for pg_idx, pg in enumerate(optimizer.param_groups):
+                num_params_total = sum(p.numel() for p in pg['params'])
+                num_params_trainable = sum(p.numel() for p in pg['params'] if p.requires_grad) 
+                self.logger.info(f"  Group {pg_idx} ('{pg.get('name', 'Unnamed')}'): LR={pg['lr']:.2e}, Trainable_Params={num_params_trainable}/{num_params_total}")
 
-        # --- 6. 等待 Replay Buffer 数据 ---
-        min_samples = self.config.get('min_sample_to_start_learner', 20000) 
-        self.logger.info(f"Waiting for Replay Buffer to have at least {min_samples} samples...")
-        last_logged_size = -1 
-        while self.replay_buffer.size() < min_samples:
-            current_size = self.replay_buffer.size()
-            if current_size > last_logged_size and (current_size % (min_samples // 10 + 1) == 0 or current_size - last_logged_size > 1000 or current_size == 0):
-                self.logger.info(f"Replay buffer size: {current_size}/{min_samples}")
-                last_logged_size = current_size
-            time.sleep(1) 
-        self.logger.info(f"Minimum samples ({min_samples}) reached. Starting training loop.")
-
-        # --- 7. 主训练循环 ---
-        cur_time_ckpt = time.time() 
-        cur_time_log = time.time() 
-        iterations = 0 
-        steps_processed_since_log = 0 
-
-
-        while True:
-            start_iter_time = time.time()
-
-            # --- 7.0 更新模型参数状态 (解冻) 和学习率 ---
-            # 解冻 Actor head
-            if hasattr(self.model, 'actor_head') and \
-               unfreeze_actor_head_after_iters > 0 and \
-               hasattr(self.model.actor_head, 'weight') and \
-               not self.model.actor_head.weight.requires_grad and \
-               iterations >= unfreeze_actor_head_after_iters:
-                self._set_requires_grad(self.model.actor_head, True)
-                for pg_idx, pg in enumerate(optimizer.param_groups):
-                    if pg.get('name') == 'actor_head':
-                        num_params = sum(p.numel() for p in pg['params'] if p.requires_grad)
-                        total_params_in_group = sum(p.numel() for p in pg['params'])
-                        self.logger.info(f"  Optimizer Group {pg_idx} ('actor_head') updated: Trainable_Params={num_params}/{total_params_in_group}")
-
-            # 解冻 Actor feature extractor 和 Critic feature extractor (使用相同的 unfreeze_actor_fe_after_iters)
-            if iterations >= unfreeze_actor_fe_after_iters and unfreeze_actor_fe_after_iters > 0 : #  Ensure unfreeze_actor_fe_after_iters > 0 to trigger unfreeze
-                # Unfreeze Actor Feature Extractor
-                if hasattr(self.model, 'feature_extractor_actor') and \
-                   hasattr(self.model.feature_extractor_actor, 'layer1') and \
-                   not self.model.feature_extractor_actor.layer1.weight.requires_grad: 
-                    self._set_requires_grad(self.model.feature_extractor_actor, True)
-                    for pg_idx, pg in enumerate(optimizer.param_groups):
-                        if pg.get('name') == 'actor_fe': 
-                            num_params = sum(p.numel() for p in pg['params'] if p.requires_grad)
-                            total_params_in_group = sum(p.numel() for p in pg['params'])
-                            self.logger.info(f"  Optimizer Group {pg_idx} ('actor_fe') updated: Trainable_Params={num_params}/{total_params_in_group}")
+            # --- 4.1 推送初始模型到模型池 ---
+            try:
+                initial_model_state_dict = self.model.to('cpu').state_dict()
+                self.model.to(device) 
+                initial_version_info = model_pool.push(initial_model_state_dict)
+                initial_version_id = initial_version_info.get('id', 'N/A') if initial_version_info else 'N/A'
+                self.logger.info(f"Pushed initial model version {initial_version_id} to Model Pool.")
+            except Exception as e:
+                self.logger.error(f"Failed to push initial model: {e}. Learner exiting.", exc_info=True)
+                if self.writer: self.writer.close()
+                self.model.to(device) 
+                return
                 
-                # MODIFICATION START: Unfreeze Critic Feature Extractor
-                if hasattr(self.model, 'feature_extractor_critic') and \
-                   hasattr(self.model.feature_extractor_critic, 'layer1') and \
-                   not self.model.feature_extractor_critic.layer1.weight.requires_grad: 
-                    self._set_requires_grad(self.model.feature_extractor_critic, True)
-                    for pg_idx, pg in enumerate(optimizer.param_groups):
-                        if pg.get('name') == 'critic_fe': 
-                            num_params = sum(p.numel() for p in pg['params'] if p.requires_grad)
-                            total_params_in_group = sum(p.numel() for p in pg['params'])
-                            self.logger.info(f"  Optimizer Group {pg_idx} ('critic_fe') updated: Trainable_Params={num_params}/{total_params_in_group}")
-                # MODIFICATION END
-            
-            # 更新学习率 (针对 Critic Head 和 Critic FE)
+            # --- 5. 初始化学习率调度器参数 ---
+            base_lr_for_scheduler = lr_critic_head 
+            use_lr_scheduler = self.config.get('use_lr_scheduler', False)
             if use_lr_scheduler:
-                scheduled_lr_for_critic_components = calculate_scheduled_lr(
-                    current_iter=iterations,
-                    base_lr=base_lr_for_scheduler, 
-                    warmup_iters=warmup_iterations,
-                    total_iters_for_decay=total_iterations_for_lr_decay,
-                    min_lr=min_lr_scheduler_critic, 
-                    initial_lr_for_warmup=initial_lr_for_warmup_critic 
-                )
-                for pg in optimizer.param_groups:
-                    if pg.get('name') == 'critic_head' or pg.get('name') == 'critic_fe':
-                        pg['lr'] = scheduled_lr_for_critic_components
-            
-            # --- 7.1. 采样和数据准备 ---
-            try:
-                batch = self.replay_buffer.sample(self.config['batch_size'])
-                if batch is None:
-                    self.logger.debug("Replay buffer sample returned None, possibly empty or too small. Sleeping...")
-                    time.sleep(0.5)
-                    continue
-            except Exception as e:
-                self.logger.error(f"Error sampling from replay buffer: {e}. Skipping iteration.", exc_info=True)
-                time.sleep(1)
-                continue
-            
-            try:
-                obs = torch.tensor(batch['state']['observation']).to(device, non_blocking=True) 
-                mask = torch.tensor(batch['state']['action_mask']).to(device, non_blocking=True)
-                states = {'obs': {'observation': obs, 'action_mask': mask}}
-                actions = torch.tensor(batch['action'], dtype=torch.long).unsqueeze(-1).to(device, non_blocking=True)
-                advs = torch.tensor(batch['adv']).to(device, non_blocking=True)
-                targets = torch.tensor(batch['target']).to(device, non_blocking=True) 
-                old_log_probs_from_buffer = torch.tensor(batch['log_prob']).to(device, non_blocking=True) 
-            except Exception as e:
-                self.logger.error(f"Error converting batch data to tensor or moving to device: {e}. Skipping iteration.", exc_info=True)
-                continue
-
-            # --- 7.2. PPO 更新 ---
-            self.model.train() 
-            policy_loss_epoch_avg = 0.0
-            critic_loss_epoch_avg = 0.0
-            entropy_loss_epoch_avg = 0.0
-            total_loss_epoch_avg = 0.0 
-            
-            try:
-                old_log_probs = old_log_probs_from_buffer.detach() 
-                ppo_epochs = self.config.get('epochs_per_batch', 5) 
-                for ppo_epoch in range(ppo_epochs):
-                    action_logits_masked, predicted_critic_values = self.model(states)
-                    action_dist = torch.distributions.Categorical(logits=action_logits_masked)
-                    log_probs = action_dist.log_prob(actions.squeeze(-1)).unsqueeze(-1) 
-                    ratio = torch.exp(log_probs - old_log_probs)
-                    clip_eps = self.config['clip']
-                    surr1 = ratio * advs
-                    surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advs
-                    
-                    current_policy_loss_val = 0.0
-                    current_entropy_loss_val = 0.0
-                    
-                    if hasattr(self.model, 'actor_head') and self.model.actor_head.weight.requires_grad:
-                        current_policy_loss_term = -torch.mean(torch.min(surr1, surr2))
-                        current_entropy_loss_term = -torch.mean(action_dist.entropy())
-                        current_policy_loss_val = current_policy_loss_term.item()
-                        current_entropy_loss_val = current_entropy_loss_term.item()
-                    else: 
-                        current_policy_loss_term = torch.tensor(0.0, device=device, requires_grad=False)
-                        current_entropy_loss_term = torch.tensor(0.0, device=device, requires_grad=False)
-
-                    current_critic_loss_term = F.mse_loss(predicted_critic_values.squeeze(-1), targets)
-                    loss = self.config['value_coeff'] * current_critic_loss_term
-                    
-                    if hasattr(self.model, 'actor_head') and self.model.actor_head.weight.requires_grad: 
-                        loss = loss + current_policy_loss_term + self.config['entropy_coeff'] * current_entropy_loss_term
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    
-                    trainable_params = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
-                    if trainable_params:
-                         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=self.config.get('grad_clip_norm', 0.3))
-                    
-                    optimizer.step()
-
-                    policy_loss_epoch_avg += current_policy_loss_val 
-                    critic_loss_epoch_avg += current_critic_loss_term.item() 
-                    entropy_loss_epoch_avg += current_entropy_loss_val
-                    total_loss_epoch_avg += loss.item() 
-
-                policy_loss_epoch_avg /= ppo_epochs
-                critic_loss_epoch_avg /= ppo_epochs
-                entropy_loss_epoch_avg /= ppo_epochs
-                total_loss_epoch_avg /= ppo_epochs
-            except Exception as e:
-                self.logger.error(f"Error during PPO update at iteration {iterations}: {e}", exc_info=True) 
-                continue 
-
-            # --- 7.3. 日志记录和 TensorBoard ---
-            steps_processed_since_log += self.config['batch_size']
-            current_time = time.time()
-            log_interval = self.config.get('log_interval_learner', 100)
-
-            if iterations % log_interval == 0: 
-                time_since_log = current_time - cur_time_log if cur_time_log and iterations > 0 else (current_time - start_iter_time if iterations == 0 else 1.0)
-                iterations_per_sec = log_interval / time_since_log if time_since_log > 0 and iterations > 0 else \
-                                     (1 / time_since_log if time_since_log > 0 and iterations == 0 else 0.0)
-                samples_per_sec = steps_processed_since_log / time_since_log if time_since_log > 0 else 0.0
-
-                buffer_size = self.replay_buffer.size()
-                buffer_stats_dict = self.replay_buffer.stats() if hasattr(self.replay_buffer, 'stats') and callable(getattr(self.replay_buffer, 'stats')) else {}
-                sample_in_rate = buffer_stats_dict.get('samples_in_per_second_smoothed', buffer_stats_dict.get('samples_in_per_second',0)) 
-                sample_out_rate = buffer_stats_dict.get('samples_out_per_second_smoothed', buffer_stats_dict.get('samples_out_per_second',0))
+                warmup_iterations = self.config.get('warmup_iterations', 1000) 
+                total_iterations_for_lr_decay = self.config.get('total_iterations_for_lr_decay', 500000) 
+                min_lr_scheduler_critic = self.config.get('min_lr_critic_schedule', 1e-6) 
+                initial_lr_for_warmup_critic = self.config.get('initial_lr_warmup_critic', base_lr_for_scheduler * 0.01)
                 
-                log_lr_critic_head, log_lr_critic_fe, log_lr_actor_head, log_lr_actor_fe = "N/A", "N/A", "N/A", "N/A"
-                for pg in optimizer.param_groups: 
-                    lr_val_str = f"{pg['lr']:.2e}"
-                    if pg.get('name') == 'critic_head': log_lr_critic_head = lr_val_str
-                    if pg.get('name') == 'critic_fe': log_lr_critic_fe = lr_val_str
-                    if pg.get('name') == 'actor_head': log_lr_actor_head = lr_val_str
-                    if pg.get('name') == 'actor_fe': log_lr_actor_fe = lr_val_str
-                
-                lr_log_str = f"LRs (CH/CF/AH/AF): {log_lr_critic_head}/{log_lr_critic_fe}/{log_lr_actor_head}/{log_lr_actor_fe}"
-                log_msg = (
-                    f"Iter: {iterations} | {lr_log_str} | "
-                    f"Loss(Actual): {total_loss_epoch_avg:.4f} " 
-                    f"(P_contrib: {policy_loss_epoch_avg:.4f}, C_contrib: {critic_loss_epoch_avg:.4f}, E_contrib: {entropy_loss_epoch_avg:.4f}) | "
-                    f"Buffer: {buffer_size} (QueueEp: {buffer_stats_dict.get('queue_size',0)}, In/s: {sample_in_rate:.1f}, Out/s: {sample_out_rate:.1f}) | " # Added QueueEp
-                    f"IPS: {iterations_per_sec:.2f} | SPS: {samples_per_sec:.1f}"
-                )
-                self.logger.info(log_msg)
+                self.logger.info(f"LR Scheduler enabled for Critic Head AND Critic FE. Both will follow the same schedule derived from Critic Head's settings:")
+                self.logger.info(f"  Schedule: Linear Warmup ({warmup_iterations} iters, from {initial_lr_for_warmup_critic:.2e} to {base_lr_for_scheduler:.2e}) "
+                                f"then Cosine Decay ({total_iterations_for_lr_decay} iters to {min_lr_scheduler_critic:.2e}).")
+                self.logger.info(f"  Initial LRs for Actor components (fixed unless scheduled separately, and may be initially frozen): "
+                                f"ActorHead={lr_actor_head:.2e}, ActorFE={lr_actor_fe:.2e}")
+            else:
+                self.logger.info(f"LR Scheduler disabled. Using fixed LRs for all components based on initial optimizer settings.")
 
-                if self.writer:
-                    self.writer.add_scalar('Loss/Total_Actual_Backward', total_loss_epoch_avg, iterations)
-                    self.writer.add_scalar('Loss/Policy_Calculated', policy_loss_epoch_avg, iterations)
-                    self.writer.add_scalar('Loss/Critic_Calculated', critic_loss_epoch_avg, iterations) 
-                    self.writer.add_scalar('Loss/Entropy_Calculated', entropy_loss_epoch_avg, iterations)
-                    self.writer.add_scalar('ReplayBuffer/SizeTimesteps', buffer_size, iterations)
-                    self.writer.add_scalar('ReplayBuffer/RateIn', sample_in_rate, iterations)
-                    self.writer.add_scalar('ReplayBuffer/RateOut', sample_out_rate, iterations)
-                    self.writer.add_scalar('ReplayBuffer/QueueSizeEpisodes', buffer_stats_dict.get('queue_size',0), iterations)
-                    self.writer.add_scalar('Performance/IterationsPerSecond_Learner', iterations_per_sec, iterations)
-                    self.writer.add_scalar('Performance/SamplesPerSecond_Learner', samples_per_sec, iterations)
+
+            # --- 6. 等待 Replay Buffer 数据 ---
+            min_samples = self.config.get('min_sample_to_start_learner', 20000) 
+            self.logger.info(f"Waiting for Replay Buffer to have at least {min_samples} samples...")
+            last_logged_size = -1 
+            while True: # Loop for waiting for buffer
+                try:
+                    current_buffer_size = self.replay_buffer.size() # Calls _flush internally
+                    if current_buffer_size >= min_samples:
+                        break
+                    if current_buffer_size > last_logged_size and \
+                    (current_buffer_size % (min_samples // 10 + 1) == 0 or \
+                        current_buffer_size - last_logged_size > self.config.get('rb_wait_log_interval_samples', 1000) or \
+                        current_buffer_size == 0):
+                        q_size = self.replay_buffer.queue.qsize() if hasattr(self.replay_buffer.queue, 'qsize') else 'N/A'
+                        self.logger.info(f"Replay buffer size: {current_buffer_size}/{min_samples}. Input queue(episodes): {q_size}")
+                        last_logged_size = current_buffer_size
+                    time.sleep(self.config.get('rb_wait_check_interval_sec', 1.0))
+                except Exception as e_rb_wait: # Catch errors during buffer size check
+                    self.logger.error(f"Error checking replay buffer size while waiting: {e_rb_wait}", exc_info=True)
+                    time.sleep(5) # Wait longer if error occurs
+            self.logger.info(f"Minimum samples ({min_samples}) reached in Replay Buffer. Starting training loop.")
+
+
+
+            # --- 7. 主训练循环 ---
+            cur_time_ckpt = time.time() 
+            cur_time_log = time.time() 
+            iterations = 0 
+            steps_processed_since_log = 0 
+
+
+            while True:
+                start_iter_time = time.time()
+
+                # --- 7.0 更新模型参数状态 (解冻) 和学习率 ---
+                # 解冻 Actor head
+                if hasattr(self.model, 'actor_head') and \
+                unfreeze_actor_head_after_iters > 0 and \
+                hasattr(self.model.actor_head, 'weight') and \
+                not self.model.actor_head.weight.requires_grad and \
+                iterations >= unfreeze_actor_head_after_iters:
+                    self._set_requires_grad(self.model.actor_head, True)
+                    for pg_idx, pg in enumerate(optimizer.param_groups):
+                        if pg.get('name') == 'actor_head':
+                            num_params = sum(p.numel() for p in pg['params'] if p.requires_grad)
+                            total_params_in_group = sum(p.numel() for p in pg['params'])
+                            self.logger.info(f"  Optimizer Group {pg_idx} ('actor_head') updated: Trainable_Params={num_params}/{total_params_in_group}")
+
+                # 解冻 Actor feature extractor 和 Critic feature extractor (使用相同的 unfreeze_actor_fe_after_iters)
+                if iterations >= unfreeze_actor_fe_after_iters and unfreeze_actor_fe_after_iters > 0 : #  Ensure unfreeze_actor_fe_after_iters > 0 to trigger unfreeze
+                    # Unfreeze Actor Feature Extractor
+                    if hasattr(self.model, 'feature_extractor_actor') and \
+                    hasattr(self.model.feature_extractor_actor, 'layer1') and \
+                    not self.model.feature_extractor_actor.layer1.weight.requires_grad: 
+                        self._set_requires_grad(self.model.feature_extractor_actor, True)
+                        for pg_idx, pg in enumerate(optimizer.param_groups):
+                            if pg.get('name') == 'actor_fe': 
+                                num_params = sum(p.numel() for p in pg['params'] if p.requires_grad)
+                                total_params_in_group = sum(p.numel() for p in pg['params'])
+                                self.logger.info(f"  Optimizer Group {pg_idx} ('actor_fe') updated: Trainable_Params={num_params}/{total_params_in_group}")
                     
+                    # MODIFICATION START: Unfreeze Critic Feature Extractor
+                    if hasattr(self.model, 'feature_extractor_critic') and \
+                    hasattr(self.model.feature_extractor_critic, 'layer1') and \
+                    not self.model.feature_extractor_critic.layer1.weight.requires_grad: 
+                        self._set_requires_grad(self.model.feature_extractor_critic, True)
+                        for pg_idx, pg in enumerate(optimizer.param_groups):
+                            if pg.get('name') == 'critic_fe': 
+                                num_params = sum(p.numel() for p in pg['params'] if p.requires_grad)
+                                total_params_in_group = sum(p.numel() for p in pg['params'])
+                                self.logger.info(f"  Optimizer Group {pg_idx} ('critic_fe') updated: Trainable_Params={num_params}/{total_params_in_group}")
+                    # MODIFICATION END
+                
+                # 更新学习率 (针对 Critic Head 和 Critic FE)
+                if use_lr_scheduler:
+                    scheduled_lr_for_critic_components = calculate_scheduled_lr(
+                        current_iter=iterations,
+                        base_lr=base_lr_for_scheduler, 
+                        warmup_iters=warmup_iterations,
+                        total_iters_for_decay=total_iterations_for_lr_decay,
+                        min_lr=min_lr_scheduler_critic, 
+                        initial_lr_for_warmup=initial_lr_for_warmup_critic 
+                    )
                     for pg in optimizer.param_groups:
-                        group_name = pg.get('name', 'UnnamedGroup')
-                        component_name_map = {
-                            'critic_head': 'CriticHead', 'critic_fe': 'CriticFE',
-                            'actor_head': 'ActorHead', 'actor_fe': 'ActorFE'
-                        }
-                        tb_component_name = component_name_map.get(group_name)
-                        if tb_component_name:
-                            is_trainable_now = False
-                            if tb_component_name == 'CriticHead' and hasattr(self.model, 'critic_head') : is_trainable_now = self.model.critic_head.weight.requires_grad
-                            elif tb_component_name == 'CriticFE' and hasattr(self.model, 'feature_extractor_critic') and hasattr(self.model.feature_extractor_critic, 'layer1') : is_trainable_now = self.model.feature_extractor_critic.layer1.weight.requires_grad
-                            elif tb_component_name == 'ActorHead' and hasattr(self.model, 'actor_head') : is_trainable_now = self.model.actor_head.weight.requires_grad
-                            elif tb_component_name == 'ActorFE' and hasattr(self.model, 'feature_extractor_actor') and hasattr(self.model.feature_extractor_actor, 'layer1') : is_trainable_now = self.model.feature_extractor_actor.layer1.weight.requires_grad
-                            
-                            if is_trainable_now:
-                                self.writer.add_scalar(f'LearningRate/{tb_component_name}', pg['lr'], iterations)
-                    self.writer.flush()
-
-                cur_time_log = current_time
-                steps_processed_since_log = 0
-            
-            # --- 7.4. 推送模型到模型池 ---
-            model_push_interval = self.config.get('model_push_interval_iters', self.config.get('model_push_interval', 10))
-            if iterations > 0 and iterations % model_push_interval == 0: 
+                        if pg.get('name') == 'critic_head' or pg.get('name') == 'critic_fe':
+                            pg['lr'] = scheduled_lr_for_critic_components
+                
+                # --- 7.1. 采样和数据准备 ---
+                self.logger.debug(f"Iter {iterations}: Attempting to sample from Replay Buffer.")
+                batch = None
                 try:
-                    model_state_to_push = self.model.to('cpu').state_dict()
-                    self.model.to(device) 
-                    pushed_version_info = model_pool.push(model_state_to_push)
-                    pushed_version_id = pushed_version_info.get('id', 'N/A') if pushed_version_info else 'N/A'
-                    self.logger.info(f"Iteration {iterations}: Pushed updated model version {pushed_version_id} to Model Pool.")
+                    batch = self.replay_buffer.sample(self.config['batch_size'])
+                except Exception as e_sample:
+                    self.logger.error(f"Iter {iterations}: Error during replay_buffer.sample(): {e_sample}", exc_info=True)
+                    time.sleep(1); continue
+
+                if batch is None:
+                    rb_size = self.replay_buffer.size() # This calls _flush
+                    q_size = self.replay_buffer.queue.qsize() if hasattr(self.replay_buffer.queue, 'qsize') else 'N/A'
+                    self.logger.info(f"Iter {iterations}: replay_buffer.sample() returned None. Buffer(timesteps): {rb_size}. InputQueue(episodes): {q_size}. Sleeping...")
+                    time.sleep(self.config.get('learner_empty_batch_sleep_sec', 1.0)) 
+                    continue
+                self.logger.debug(f"Iter {iterations}: Batch sampled successfully.")
+                
+                try:
+                    obs = torch.tensor(batch['state']['observation']).to(device, non_blocking=True) 
+                    mask = torch.tensor(batch['state']['action_mask']).to(device, non_blocking=True)
+                    states = {'obs': {'observation': obs, 'action_mask': mask}}
+                    actions = torch.tensor(batch['action'], dtype=torch.long).unsqueeze(-1).to(device, non_blocking=True)
+                    advs = torch.tensor(batch['adv']).to(device, non_blocking=True)
+                    targets = torch.tensor(batch['target']).to(device, non_blocking=True) 
+                    old_log_probs_from_buffer = torch.tensor(batch['log_prob']).to(device, non_blocking=True) 
+                except Exception as e:
+                    self.logger.error(f"Error converting batch data to tensor or moving to device: {e}. Skipping iteration.", exc_info=True)
+                    continue
+
+                # --- 7.2. PPO 更新 ---
+                self.model.train() 
+                policy_loss_epoch_avg = 0.0
+                critic_loss_epoch_avg = 0.0
+                entropy_loss_epoch_avg = 0.0
+                total_loss_epoch_avg = 0.0 
+                
+                try:
+                    old_log_probs = old_log_probs_from_buffer.detach() 
+                    ppo_epochs = self.config.get('epochs_per_batch', 5) 
+                    for ppo_epoch in range(ppo_epochs):
+                        action_logits_masked, predicted_critic_values = self.model(states)
+                        action_dist = torch.distributions.Categorical(logits=action_logits_masked)
+                        log_probs = action_dist.log_prob(actions.squeeze(-1)).unsqueeze(-1) 
+                        ratio = torch.exp(log_probs - old_log_probs)
+                        clip_eps = self.config['clip']
+                        surr1 = ratio * advs
+                        surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advs
+                        
+                        current_policy_loss_val = 0.0
+                        current_entropy_loss_val = 0.0
+                        
+                        if hasattr(self.model, 'actor_head') and self.model.actor_head.weight.requires_grad:
+                            current_policy_loss_term = -torch.mean(torch.min(surr1, surr2))
+                            current_entropy_loss_term = -torch.mean(action_dist.entropy())
+                            current_policy_loss_val = current_policy_loss_term.item()
+                            current_entropy_loss_val = current_entropy_loss_term.item()
+                        else: 
+                            current_policy_loss_term = torch.tensor(0.0, device=device, requires_grad=False)
+                            current_entropy_loss_term = torch.tensor(0.0, device=device, requires_grad=False)
+
+                        current_critic_loss_term = F.mse_loss(predicted_critic_values.squeeze(-1), targets)
+                        loss = self.config['value_coeff'] * current_critic_loss_term
+                        
+                        if hasattr(self.model, 'actor_head') and self.model.actor_head.weight.requires_grad: 
+                            loss = loss + current_policy_loss_term + self.config['entropy_coeff'] * current_entropy_loss_term
+                        
+                        optimizer.zero_grad()
+                        loss.backward()
+                        
+                        trainable_params = [p for p in self.model.parameters() if p.requires_grad and p.grad is not None]
+                        if trainable_params:
+                            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=self.config.get('grad_clip_norm', 0.3))
+                        
+                        optimizer.step()
+
+                        policy_loss_epoch_avg += current_policy_loss_val 
+                        critic_loss_epoch_avg += current_critic_loss_term.item() 
+                        entropy_loss_epoch_avg += current_entropy_loss_val
+                        total_loss_epoch_avg += loss.item() 
+
+                    policy_loss_epoch_avg /= ppo_epochs
+                    critic_loss_epoch_avg /= ppo_epochs
+                    entropy_loss_epoch_avg /= ppo_epochs
+                    total_loss_epoch_avg /= ppo_epochs
+                except Exception as e:
+                    self.logger.error(f"Error during PPO update at iteration {iterations}: {e}", exc_info=True) 
+                    continue 
+
+                # --- 7.3. 日志记录和 TensorBoard ---
+                steps_processed_since_log += self.config['batch_size']
+                current_time = time.time()
+                log_interval = self.config.get('log_interval_learner', 100)
+
+                if iterations % log_interval == 0: 
+                    time_since_log = current_time - cur_time_log if cur_time_log and iterations > 0 else (current_time - start_iter_time if iterations == 0 else 1.0)
+                    iterations_per_sec = log_interval / time_since_log if time_since_log > 0 and iterations > 0 else \
+                                        (1 / time_since_log if time_since_log > 0 and iterations == 0 else 0.0)
+                    samples_per_sec = steps_processed_since_log / time_since_log if time_since_log > 0 else 0.0
+
+                    buffer_size = self.replay_buffer.size()
+                    buffer_stats_dict = self.replay_buffer.stats() if hasattr(self.replay_buffer, 'stats') and callable(getattr(self.replay_buffer, 'stats')) else {}
+                    sample_in_rate = buffer_stats_dict.get('samples_in_per_second_smoothed', buffer_stats_dict.get('samples_in_per_second',0)) 
+                    sample_out_rate = buffer_stats_dict.get('samples_out_per_second_smoothed', buffer_stats_dict.get('samples_out_per_second',0))
+                    
+                    log_lr_critic_head, log_lr_critic_fe, log_lr_actor_head, log_lr_actor_fe = "N/A", "N/A", "N/A", "N/A"
+                    for pg in optimizer.param_groups: 
+                        lr_val_str = f"{pg['lr']:.2e}"
+                        if pg.get('name') == 'critic_head': log_lr_critic_head = lr_val_str
+                        if pg.get('name') == 'critic_fe': log_lr_critic_fe = lr_val_str
+                        if pg.get('name') == 'actor_head': log_lr_actor_head = lr_val_str
+                        if pg.get('name') == 'actor_fe': log_lr_actor_fe = lr_val_str
+                    
+                    lr_log_str = f"LRs (CH/CF/AH/AF): {log_lr_critic_head}/{log_lr_critic_fe}/{log_lr_actor_head}/{log_lr_actor_fe}"
+                    log_msg = (
+                        f"Iter: {iterations} | {lr_log_str} | "
+                        f"Loss(Actual): {total_loss_epoch_avg:.4f} " 
+                        f"(P_contrib: {policy_loss_epoch_avg:.4f}, C_contrib: {critic_loss_epoch_avg:.4f}, E_contrib: {entropy_loss_epoch_avg:.4f}) | "
+                        f"Buffer: {buffer_size} (QueueEp: {buffer_stats_dict.get('queue_size',0)}, In/s: {sample_in_rate:.1f}, Out/s: {sample_out_rate:.1f}) | " # Added QueueEp
+                        f"IPS: {iterations_per_sec:.2f} | SPS: {samples_per_sec:.1f}"
+                    )
+                    self.logger.info(log_msg)
+
                     if self.writer:
-                        if isinstance(pushed_version_id, (int, float)) and pushed_version_id != 'N/A':
-                            try:
-                                self.writer.add_scalar('ModelPool/PushedVersionID', float(pushed_version_id), iterations)
-                            except ValueError:
-                                self.logger.warning(f"Could not convert pushed_version_id '{pushed_version_id}' to float for TensorBoard.")
-                except Exception as e:
-                    self.logger.error(f"Failed to push model at iteration {iterations}: {e}", exc_info=True)
-                    self.model.to(device) 
+                        self.writer.add_scalar('Loss/Total_Actual_Backward', total_loss_epoch_avg, iterations)
+                        self.writer.add_scalar('Loss/Policy_Calculated', policy_loss_epoch_avg, iterations)
+                        self.writer.add_scalar('Loss/Critic_Calculated', critic_loss_epoch_avg, iterations) 
+                        self.writer.add_scalar('Loss/Entropy_Calculated', entropy_loss_epoch_avg, iterations)
+                        self.writer.add_scalar('ReplayBuffer/SizeTimesteps', buffer_size, iterations)
+                        self.writer.add_scalar('ReplayBuffer/RateIn', sample_in_rate, iterations)
+                        self.writer.add_scalar('ReplayBuffer/RateOut', sample_out_rate, iterations)
+                        self.writer.add_scalar('ReplayBuffer/QueueSizeEpisodes', buffer_stats_dict.get('queue_size',0), iterations)
+                        self.writer.add_scalar('Performance/IterationsPerSecond_Learner', iterations_per_sec, iterations)
+                        self.writer.add_scalar('Performance/SamplesPerSecond_Learner', samples_per_sec, iterations)
+                        
+                        for pg in optimizer.param_groups:
+                            group_name = pg.get('name', 'UnnamedGroup')
+                            component_name_map = {
+                                'critic_head': 'CriticHead', 'critic_fe': 'CriticFE',
+                                'actor_head': 'ActorHead', 'actor_fe': 'ActorFE'
+                            }
+                            tb_component_name = component_name_map.get(group_name)
+                            if tb_component_name:
+                                is_trainable_now = False
+                                if tb_component_name == 'CriticHead' and hasattr(self.model, 'critic_head') : is_trainable_now = self.model.critic_head.weight.requires_grad
+                                elif tb_component_name == 'CriticFE' and hasattr(self.model, 'feature_extractor_critic') and hasattr(self.model.feature_extractor_critic, 'layer1') : is_trainable_now = self.model.feature_extractor_critic.layer1.weight.requires_grad
+                                elif tb_component_name == 'ActorHead' and hasattr(self.model, 'actor_head') : is_trainable_now = self.model.actor_head.weight.requires_grad
+                                elif tb_component_name == 'ActorFE' and hasattr(self.model, 'feature_extractor_actor') and hasattr(self.model.feature_extractor_actor, 'layer1') : is_trainable_now = self.model.feature_extractor_actor.layer1.weight.requires_grad
+                                
+                                if is_trainable_now:
+                                    self.writer.add_scalar(f'LearningRate/{tb_component_name}', pg['lr'], iterations)
+                        self.writer.flush()
 
-            # --- 7.5. 保存检查点 ---
-            t_now_ckpt = time.time()
-            ckpt_interval_sec = self.config.get('ckpt_save_interval_seconds', 600)
-            default_ckpt_path = os.path.join(log_base_dir, experiment_name, 'checkpoints', self.name)
-            ckpt_dir = self.config.get('ckpt_save_path', default_ckpt_path)
+                    cur_time_log = current_time
+                    steps_processed_since_log = 0
+                
+                # --- 7.4. 推送模型到模型池 ---
+                model_push_interval = self.config.get('model_push_interval_iters', self.config.get('model_push_interval', 10))
+                if iterations > 0 and iterations % model_push_interval == 0: 
+                    self.logger.info(f"Iter {iterations}: Attempting to push model to Model Pool.")
+                    try:
+                        model_state_to_push = self.model.to('cpu').state_dict()
+                        self.model.to(device) 
+                        pushed_info = model_pool.push(model_state_to_push) # model_pool is from run() scope
+                        if pushed_info is None: # Check if push failed
+                            self.logger.error(f"Iter {iterations}: Pushing model to Model Pool returned None (push failed).")
+                        else:
+                            pushed_version_id = pushed_info.get('id', 'N/A')
+                            self.logger.info(f"Iteration {iterations}: Pushed updated model version {pushed_version_id} to Model Pool.")
+                            if self.writer:
+                                if isinstance(pushed_version_id, (int, float)) and pushed_version_id != 'N/A':
+                                    try:
+                                        self.writer.add_scalar('ModelPool/PushedVersionID', float(pushed_version_id), iterations)
+                                    except ValueError:
+                                        self.logger.warning(f"Could not convert pushed_version_id '{pushed_version_id}' to float for TensorBoard.")
+                    except Exception as e_push:
+                        self.logger.error(f"Iter {iterations}: Failed to push model: {e_push}", exc_info=True)
+                        self.model.to(device) # Ensure model is back on device if error
 
-            if iterations > 0 and t_now_ckpt - cur_time_ckpt > ckpt_interval_sec : 
-                os.makedirs(ckpt_dir, exist_ok=True)
-                path = os.path.join(ckpt_dir, f'model_iter_{iterations}.pt')
-                self.logger.info(f"Saving checkpoint at iteration {iterations} to {path}...")
-                try:
-                    serializable_config = {k: v for k, v in self.config.items() if isinstance(v, (int, float, str, bool, list, dict, type(None)))}
-                    torch.save({
-                        'iteration': iterations,
-                        'model_state_dict': self.model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'config': serializable_config 
-                    }, path)
-                    cur_time_ckpt = t_now_ckpt
-                except Exception as e:
-                    self.logger.error(f"Failed to save checkpoint at iteration {iterations}: {e}", exc_info=True)
+                # --- 7.5. 保存检查点 ---
+                t_now_ckpt = time.time()
+                ckpt_interval_sec = self.config.get('ckpt_save_interval_seconds', 600)
+                default_ckpt_path = os.path.join(log_base_dir, experiment_name, 'checkpoints', self.name)
+                ckpt_dir = self.config.get('ckpt_save_path', default_ckpt_path)
 
-            iterations += 1
+                if iterations > 0 and t_now_ckpt - cur_time_ckpt > ckpt_interval_sec : 
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    path = os.path.join(ckpt_dir, f'model_iter_{iterations}.pt')
+                    self.logger.info(f"Saving checkpoint at iteration {iterations} to {path}...")
+                    try:
+                        serializable_config = {k: v for k, v in self.config.items() if isinstance(v, (int, float, str, bool, list, dict, type(None)))}
+                        torch.save({
+                            'iteration': iterations,
+                            'model_state_dict': self.model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'config': serializable_config 
+                        }, path)
+                        cur_time_ckpt = t_now_ckpt
+                    except Exception as e:
+                        self.logger.error(f"Failed to save checkpoint at iteration {iterations}: {e}", exc_info=True)
 
-        # --- 循环结束 ---
-        self.logger.info("Learner training loop finished (or was interrupted).")
-        if self.writer:
-            self.writer.close()
+                iterations += 1
+
+            # --- 循环结束 ---
+            self.logger.info("Learner training loop finished (or was interrupted).")
+            if self.writer:
+                self.writer.close()
+        
+        except KeyboardInterrupt: # 捕获在此主逻辑块中发生的 Ctrl+C
+            self.logger.warning(f"Learner {self.name} (PID: {os.getpid()}) caught KeyboardInterrupt in main try block. Signaling shutdown.")
+            # 这里的 self._signal_handler 可能不会被再次调用，因为已经有一个正在处理
+            # 但如果信号处理程序设计为可重入或通过 self.shutting_down 标志工作，则可以
+            if not self.shutting_down:
+                 self._signal_handler(signal.SIGINT, None) # 手动调用一次处理逻辑
+        except Exception as e_main_run:
+            self.logger.critical(f"Learner {self.name} (PID: {os.getpid()}) encountered an unhandled exception in main run logic: {e_main_run}", exc_info=True)
+        finally:
+            self.logger.info(f"Learner {self.name} (PID: {os.getpid()}) entering finally block of run method.")
+            # 确保即使没有信号，在 run 方法正常或异常结束时也尝试清理
+            if not self.shutting_down: # 如果不是通过信号处理程序退出的
+                self.shutting_down = True # 标记一下，避免重复清理
+                self.logger.info("Learner run method finished or aborted without signal. Performing cleanup...")
+                if self.model_pool_server_instance:
+                    try:
+                        self.model_pool_server_instance.cleanup()
+                    except Exception as e_final_cleanup:
+                        self.logger.error(f"Error during final ModelPoolServer cleanup: {e_final_cleanup}", exc_info=True)
+                if self.writer:
+                    try:
+                        self.writer.close()
+                    except Exception as e_final_writer:
+                         self.logger.error(f"Error during final TensorBoard writer close: {e_final_writer}", exc_info=True)
+            
+            # 恢复原始的信号处理器，以避免影响其他可能的代码或Python退出处理
+            # 这通常在进程即将完全退出时执行
+            try:
+                signal.signal(signal.SIGINT, original_sigint_handler)
+                signal.signal(signal.SIGTERM, original_sigterm_handler)
+            except Exception as e_restore_signal:
+                 self.logger.warning(f"Could not restore original signal handlers: {e_restore_signal}")
+            self.logger.info(f"Learner {self.name} (PID: {os.getpid()}) run method finished.")

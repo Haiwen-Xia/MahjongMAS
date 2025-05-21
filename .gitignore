@@ -10,3 +10,4 @@
 **/data.txt
 **/tensorboard_logs
 **/*.json
+**/*.gz

@@ -145,7 +145,7 @@ class ReplayBuffer:
                 unpacked_values = self._unpack(value_list) # value_list should be a list of items for this key
                 if len(unpacked_values) != episode_len and episode_len !=0 :
                     # This would be an error: data inconsistency within an episode
-                    # print(f"Warning: Key {key} has {len(unpacked_values)} items, expected {episode_len}")
+                    print(f"Warning: Key {key} has {len(unpacked_values)} items, expected {episode_len}")
                     # Handle error or skip this key
                     continue 
                 for i, v_item in enumerate(unpacked_values):

@@ -1,10 +1,10 @@
 {
     "evaluator_id": "offline_fixed_match_002",
     "log_base_dir": "/home/dataset-assist-0/data/Mahjong/RL/offline_evaluation",
-    "experiment_name": "Freeze_Critic_FE_Entropy=-1e-4",
+    "experiment_name": "Normalized_reward_Entropy=-3e-3_model_pool_size=120_PPO_update_epoch=2_Add_ir_policy=0.15_trail2",
     "in_channels": 187,
-    "device": "cpu",
-    "evaluation_episodes": 256,
+"device": "cpu",
+    "evaluation_episodes": 2000,
     "env_config": {
         "agent_clz": "FeatureAgent" 
     },
@@ -13,13 +13,13 @@
             "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Separate_Feature_Extractor/model_iter_249.pt"
         },
         "RL_v1" : {
-            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Freeze_Critic_FE_Entropy=-1e-4/model_iter_1412.pt"
+            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Normalized_reward_Entropy=-3e-3_model_pool_size=120_PPO_update_epoch=2_Add_ir_policy=0.15/model_iter_1147.pt"
         },
         "RL_v2" : {
-            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Freeze_Critic_FE_Entropy=-1e-4/model_iter_2574.pt"
+            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Normalized_reward_Entropy=-3e-3_model_pool_size=120_PPO_update_epoch=2_Add_ir_policy=0.15/model_iter_3659.pt"
         },
         "RL_v3" : {
-            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Freeze_Critic_FE_Entropy=-1e-4/model_iter_4907.pt"
+            "model_dir" : "/home/dataset-assist-0/data/Mahjong/RL/model/Normalized_reward_Entropy=-3e-3_model_pool_size=120_PPO_update_epoch=2_Add_ir_policy=0.15/model_iter_5450.pt"
         }
     }
 }
