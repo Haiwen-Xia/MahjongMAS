@@ -43,9 +43,19 @@ class Learner(Process):
         self.writer = None # 初始化 TensorBoard writer 为 None
         self.model = None # Initialize model attribute
 
-        self.model_pool_server_instance = None # 添加一个属性来持有 ModelPoolServer 实例
-        self.shutting_down = False # 信号处理标志
+        self.inference_server_cmd_queue = config.get('inference_server_cmd_queue')
+        if self.inference_server_cmd_queue is None:
+            # 如果没有提供命令队列，Learner 将无法与 InferenceServer 通信
+            # 根据您的设计，这可能是一个致命错误
+            # 这里可以先记录一个警告，在 run 方法开始时再做更严格的检查
+            print(f"Warning: Learner 未收到 'inference_server_cmd_queue'。将无法更新 InferenceServer。")
+            # (在实际代码中，您可能希望在这里就抛出异常或退出)
 
+        self.shutdown_event = config.get('shutdown_event')
+        if self.shutdown_event is None:
+            print(f"Warning: Learner 未收到 'shutdown_event'。可能无法优雅关闭。")
+
+        self.shutting_down = False # 信号处理或关闭事件的标志
 
     def _signal_handler(self, signum, frame):
         """处理终止信号，确保资源被清理。"""
@@ -56,15 +66,7 @@ class Learner(Process):
         signal_name = signal.Signals(signum).name
         self.logger.warning(f"Learner process {self.name} (PID: {os.getpid()}) received signal {signal_name} ({signum}). Initiating graceful shutdown...")
         
-        # 1. 清理 ModelPoolServer (如果它是由 Learner 创建和拥有的)
-        if self.model_pool_server_instance:
-            self.logger.info("Learner attempting to cleanup ModelPoolServer...")
-            try:
-                self.model_pool_server_instance.cleanup() # 调用显式的清理方法
-            except Exception as e_cleanup:
-                self.logger.error(f"Error during ModelPoolServer cleanup in signal handler: {e_cleanup}", exc_info=True)
-        
-        # 2. 关闭 TensorBoard writer (如果存在)
+        # 关闭 TensorBoard writer (如果存在)
         if self.writer:
             self.logger.info("Learner closing TensorBoard writer...")
             try:
@@ -112,10 +114,6 @@ class Learner(Process):
         8. 定期保存模型检查点。
         9. 记录日志和 TensorBoard 指标。
         """
-
-    def run(self):
-
-
         # --- 设置信号处理器 ---
         # 通常在进程的主要执行逻辑开始时设置
         # 注意：在 Windows 上，signal.SIGINT 可能只能被主线程捕获。
@@ -141,31 +139,45 @@ class Learner(Process):
             print(f"CRITICAL: Logger for {self.name} could not be initialized. Exiting.")
             if self.writer: self.writer.close()
             return
-        self.logger.info(f"Learner process {self.name} started. Config: \n{json.dumps(self.config, indent=2, ensure_ascii=False)}")
-
-
-        # --- 2. 初始化模型池服务器 ---
+        self.logger.info(f"Learner process {self.name} started. PID: {os.getpid()}.")
+        
+        # --- 修改部分：更安全地记录配置信息 ---
+        config_to_log = {}
+        known_unserializable_keys = ['shutdown_event', 'inference_server_cmd_queue'] # 以及其他可能的队列或事件对象
+        
+        for key, value in self.config.items():
+            if key in known_unserializable_keys:
+                config_to_log[key] = f"<{type(value).__name__} object at {hex(id(value))}>" # 或者 str(value)
+            elif callable(value) and hasattr(value, '__name__'): # 例如模型类
+                config_to_log[key] = f"<class '{value.__name__}'>"
+            else:
+                # 对于其他值，先尝试直接复制，json.dumps 的 default 会处理后续问题
+                config_to_log[key] = value 
+        
         try:
-            model_pool_name = self.config.get('model_pool_name')
-            if not model_pool_name:
-                self.logger.critical("Config 'model_pool_name' is not set. Learner exiting.")
-                # 在 finally 中恢复原始信号处理器并退出
-                signal.signal(signal.SIGINT, original_sigint_handler)
-                signal.signal(signal.SIGTERM, original_sigterm_handler)
-                return
-            self.model_pool_server_instance = ModelPoolServer(self.config['model_pool_size'], model_pool_name)
-            # model_pool 变量现在也指向这个实例，方便后续代码使用
-            model_pool = self.model_pool_server_instance 
-            self.logger.info(f"Model Pool Server '{model_pool_name}' initialized with size {self.config['model_pool_size']}.")
-        except Exception as e:
-            self.logger.critical(f"Failed to initialize Model Pool Server: {e}. Learner exiting.", exc_info=True)
-            if self.writer: self.writer.close()
-            signal.signal(signal.SIGINT, original_sigint_handler)
-            signal.signal(signal.SIGTERM, original_sigterm_handler)
+            # 使用 default=str 作为备用方案处理其他未预料到的不可序列化类型
+            config_json_str = json.dumps(config_to_log, indent=2, ensure_ascii=False, default=str)
+            self.logger.info(f"Learner Config (serializable view): \n{config_json_str}")
+        except Exception as e_json:
+            self.logger.error(f"Failed to serialize config for logging: {e_json}. Logging config keys only.")
+            # 如果上面仍然失败，只记录键名或更简单的表示
+            config_keys_str = json.dumps(list(self.config.keys()), indent=2, ensure_ascii=False)
+            self.logger.info(f"Learner Config Keys: \n{config_keys_str}")
+
+        # self.logger.info(f"Learner process {self.name} started. Config: \n{json.dumps(self.config, indent=2, ensure_ascii=False)}")
+
+        # 检查必要的队列是否存在
+        if self.inference_server_cmd_queue is None:
+            self.logger.critical("'inference_server_cmd_queue' not provided in config. Learner cannot communicate with InferenceServer. Exiting.")
+            # ... (恢复信号处理器并退出) ...
             return
+        if self.shutdown_event is None:
+            self.logger.warning("'shutdown_event' not provided. Learner might not shut down gracefully via main process signal.")
+            # 可以选择不退出，但这是一个潜在问题
+        
+        self.logger.info("Learner will communicate with an external InferenceServer.")
 
         # 后续逻辑全部放在 try 中, 使得我们手动终止程序时会自动清理 ModelPoolServer 实例
-
         try:
             # --- 3. 初始化模型 ---
             device = torch.device(self.config['device'])
@@ -327,18 +339,23 @@ class Learner(Process):
                 num_params_trainable = sum(p.numel() for p in pg['params'] if p.requires_grad) 
                 self.logger.info(f"  Group {pg_idx} ('{pg.get('name', 'Unnamed')}'): LR={pg['lr']:.2e}, Trainable_Params={num_params_trainable}/{num_params_total}")
 
-            # --- 4.1 推送初始模型到模型池 ---
+            # ---  4.1 推送初始模型到 InferenceServer ---
+            self.logger.info("Sending initial model state to InferenceServer to set its eval_model...")
             try:
-                initial_model_state_dict = self.model.to('cpu').state_dict()
-                self.model.to(device) 
-                initial_version_info = model_pool.push(initial_model_state_dict)
-                initial_version_id = initial_version_info.get('id', 'N/A') if initial_version_info else 'N/A'
-                self.logger.info(f"Pushed initial model version {initial_version_id} to Model Pool.")
-            except Exception as e:
-                self.logger.error(f"Failed to push initial model: {e}. Learner exiting.", exc_info=True)
-                if self.writer: self.writer.close()
-                self.model.to(device) 
-                return
+                # 获取 Learner 本地模型的 state_dict (通常在 CPU 上获取以保证兼容性)
+                initial_model_state_cpu = self.model.to('cpu').state_dict()
+                self.model.to(device) # 将 Learner 的模型移回其训练设备
+
+                # 发送命令和 state_dict 给 InferenceServer
+                # InferenceServer 将用这个 state_dict 更新其内部的 model_eval
+                if self.inference_server_cmd_queue: # 确保队列存在
+                    self.inference_server_cmd_queue.put(("UPDATE_EVAL_MODEL", initial_model_state_cpu))
+                    self.logger.info("Command 'UPDATE_EVAL_MODEL' with initial state sent to InferenceServer.")
+                else:
+                    self.logger.error("Cannot send initial model to InferenceServer: command queue is None.")
+            except Exception as e_init_push:
+                self.logger.critical(f"Failed to send initial model state to InferenceServer: {e_init_push}. Learner exiting.", exc_info=True)
+                raise # 抛出异常，由外层 finally 处理清理
                 
             # --- 5. 初始化学习率调度器参数 ---
             base_lr_for_scheduler = lr_critic_head 
@@ -600,28 +617,30 @@ class Learner(Process):
                     cur_time_log = current_time
                     steps_processed_since_log = 0
                 
-                # --- 7.4. 推送模型到模型池 ---
-                model_push_interval = self.config.get('model_push_interval_iters', self.config.get('model_push_interval', 10))
-                if iterations > 0 and iterations % model_push_interval == 0: 
-                    self.logger.info(f"Iter {iterations}: Attempting to push model to Model Pool.")
+                # --- 修改部分 开始: 7.4 更新 InferenceServer 中的模型 ---
+                update_eval_model_interval = self.config.get('model_push_interval', 10)
+                
+                if iterations > 0 and iterations % update_eval_model_interval == 0: 
+                    self.logger.info(f"Iter {iterations}: Attempting to send updated model state to InferenceServer for its eval_model.")
                     try:
-                        model_state_to_push = self.model.to('cpu').state_dict()
-                        self.model.to(device) 
-                        pushed_info = model_pool.push(model_state_to_push) # model_pool is from run() scope
-                        if pushed_info is None: # Check if push failed
-                            self.logger.error(f"Iter {iterations}: Pushing model to Model Pool returned None (push failed).")
+                        # 获取 Learner 当前模型 (self.model) 的 state_dict
+                        current_model_state_cpu = self.model.to('cpu').state_dict()
+                        self.model.to(device) # 确保 Learner 的模型移回其训练设备
+
+                        if self.inference_server_cmd_queue:
+                            self.inference_server_cmd_queue.put(("UPDATE_EVAL_MODEL", current_model_state_cpu))
+                            self.logger.info(f"Iter {iterations}: Command 'UPDATE_EVAL_MODEL' sent to InferenceServer.")
+                            # 由于 Server 不直接为此命令返回版本ID，相关的 TensorBoard 日志可能需要调整或移除
+                            # if self.writer:
+                            #     self.writer.add_scalar('InferenceServer/EvalModelUpdateSignalSent', iterations, iterations)
                         else:
-                            pushed_version_id = pushed_info.get('id', 'N/A')
-                            self.logger.info(f"Iteration {iterations}: Pushed updated model version {pushed_version_id} to Model Pool.")
-                            if self.writer:
-                                if isinstance(pushed_version_id, (int, float)) and pushed_version_id != 'N/A':
-                                    try:
-                                        self.writer.add_scalar('ModelPool/PushedVersionID', float(pushed_version_id), iterations)
-                                    except ValueError:
-                                        self.logger.warning(f"Could not convert pushed_version_id '{pushed_version_id}' to float for TensorBoard.")
-                    except Exception as e_push:
-                        self.logger.error(f"Iter {iterations}: Failed to push model: {e_push}", exc_info=True)
-                        self.model.to(device) # Ensure model is back on device if error
+                            self.logger.error(f"Iter {iterations}: Cannot send model update to InferenceServer: command queue is None.")
+
+                    except Exception as e_update_eval_model:
+                        self.logger.error(f"Iter {iterations}: Failed to send 'UPDATE_EVAL_MODEL' command: {e_update_eval_model}", exc_info=True)
+                        if hasattr(self.model, 'to'): # 确保模型移回设备
+                            try: self.model.to(device)
+                            except Exception as e_move_device_err: self.logger.error(f"Error moving model back to device after update_eval_model error: {e_move_device_err}")
 
                 # --- 7.5. 保存检查点 ---
                 t_now_ckpt = time.time()
@@ -652,36 +671,25 @@ class Learner(Process):
             if self.writer:
                 self.writer.close()
         
-        except KeyboardInterrupt: # 捕获在此主逻辑块中发生的 Ctrl+C
-            self.logger.warning(f"Learner {self.name} (PID: {os.getpid()}) caught KeyboardInterrupt in main try block. Signaling shutdown.")
-            # 这里的 self._signal_handler 可能不会被再次调用，因为已经有一个正在处理
-            # 但如果信号处理程序设计为可重入或通过 self.shutting_down 标志工作，则可以
-            if not self.shutting_down:
-                 self._signal_handler(signal.SIGINT, None) # 手动调用一次处理逻辑
+        except KeyboardInterrupt: 
+            self.logger.warning(f"Learner {self.name} (PID: {os.getpid()}) caught KeyboardInterrupt in main try block.")
+            if not self.shutting_down: # 如果信号处理器还未运行
+                 self._signal_handler(signal.SIGINT, None) 
         except Exception as e_main_run:
             self.logger.critical(f"Learner {self.name} (PID: {os.getpid()}) encountered an unhandled exception in main run logic: {e_main_run}", exc_info=True)
         finally:
             self.logger.info(f"Learner {self.name} (PID: {os.getpid()}) entering finally block of run method.")
-            # 确保即使没有信号，在 run 方法正常或异常结束时也尝试清理
-            if not self.shutting_down: # 如果不是通过信号处理程序退出的
-                self.shutting_down = True # 标记一下，避免重复清理
-                self.logger.info("Learner run method finished or aborted without signal. Performing cleanup...")
-                if self.model_pool_server_instance:
-                    try:
-                        self.model_pool_server_instance.cleanup()
-                    except Exception as e_final_cleanup:
-                        self.logger.error(f"Error during final ModelPoolServer cleanup: {e_final_cleanup}", exc_info=True)
+            if not self.shutting_down: 
+                self.shutting_down = True 
+                self.logger.info("Learner run method finished or aborted without external signal. Performing final cleanup...")
+                # Learner 不再拥有 ModelPoolServer，所以不在这里清理它
                 if self.writer:
-                    try:
-                        self.writer.close()
-                    except Exception as e_final_writer:
-                         self.logger.error(f"Error during final TensorBoard writer close: {e_final_writer}", exc_info=True)
+                    try: self.writer.close()
+                    except Exception as e_final_writer: self.logger.error(f"Error during final TensorBoard writer close: {e_final_writer}", exc_info=True)
             
-            # 恢复原始的信号处理器，以避免影响其他可能的代码或Python退出处理
-            # 这通常在进程即将完全退出时执行
             try:
                 signal.signal(signal.SIGINT, original_sigint_handler)
                 signal.signal(signal.SIGTERM, original_sigterm_handler)
             except Exception as e_restore_signal:
-                 self.logger.warning(f"Could not restore original signal handlers: {e_restore_signal}")
-            self.logger.info(f"Learner {self.name} (PID: {os.getpid()}) run method finished.")
+                 self.logger.warning(f"Could not restore original signal handlers in Learner: {e_restore_signal}")
+            self.logger.info(f"Learner {self.name} (PID: {os.getpid()}) run method fully completed.")
