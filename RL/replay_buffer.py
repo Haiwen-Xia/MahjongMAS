@@ -116,70 +116,231 @@ class ReplayBuffer:
             'cumulative_sample_out': self.cumulative_sample_out,
             'cumulative_episode_in': self.cumulative_episode_in,
         }
-
-
+    
     def _unpack(self, data):
-        if isinstance(data, dict): # Changed type() to isinstance() for robustness
-            res = []
-            # Find the length of the episode from the first list-like value
-            # This assumes all features in an episode have the same number of timesteps
-            episode_len = 0
-            for value in data.values():
-                if isinstance(value, (list, np.ndarray)): # Should be list or ndarray of features
-                    episode_len = len(value)
-                    break
-            if episode_len == 0 and data: # Non-empty dict but no list-like values or empty lists
-                 # This might indicate an issue with how episode data is structured or if it's a single step
-                 # For now, if no length, assume it's a single step dict to be wrapped in a list
-                # Or handle as an error / special case depending on expected data format
-                # Let's assume for now _unpack is always called with list-like structures for episode data
-                # If 'data' can be a single timestep dict, _unpack logic needs adjustment.
-                # Given it's called on 'episode_data', it's likely a collection of timesteps.
-                pass
-
-
-            if not data: return [] # Handle empty dict case for episode_data
-
-            res = [{} for _ in range(episode_len)]
-            for key, value_list in data.items():
-                unpacked_values = self._unpack(value_list) # value_list should be a list of items for this key
-                if len(unpacked_values) != episode_len and episode_len !=0 :
-                    # This would be an error: data inconsistency within an episode
-                    print(f"Warning: Key {key} has {len(unpacked_values)} items, expected {episode_len}")
-                    # Handle error or skip this key
-                    continue 
-                for i, v_item in enumerate(unpacked_values):
-                    if i < episode_len: # safety for res index
-                        res[i][key] = v_item
-            return res
-        elif isinstance(data, (list, tuple, deque)): # if it's already a list of items (e.g. list of rewards)
-            return list(data) # Ensure it's a plain list, or unpack further if elements are dicts
-        else: # individual numbers, strings, or ndarrays (not representing multiple timesteps for this key)
-            # This branch is tricky for _unpack. _unpack's goal is to yield a LIST of timestep dicts.
-            # If 'data' is a single ndarray for a single timestep, it should be wrapped.
-            # The original logic `return list(data)` for non-dicts is likely for when `value` is a list of numbers/arrays already.
-            # Example: data['rewards'] = [r1, r2, r3] -> _unpack([r1,r2,r3]) -> [r1,r2,r3] (correct)
-            return list(data) # This assumes if not dict, it's already an iterable of per-timestep features
-                                # or a single feature that should be iterated by the caller's _unpack.
-
-    def _pack(self, data_list_of_dicts): # data is a list of timestep dicts
+        """
+        将完整批次数据拆分为单独的样本。
+        递归地处理嵌套字典结构，返回一个样本列表。
+        
+        Args:
+            data: 要拆分的数据，可以是字典、列表或单个值
+            
+        Returns:
+            list: 样本列表
+        """
+        try:
+            if isinstance(data, dict):
+                res = []
+                # 找出episode的长度（从第一个list类型的值）
+                episode_len = 0
+                for value in data.values():
+                    if isinstance(value, (list, np.ndarray)):
+                        episode_len = len(value)
+                        break
+                
+                # 特殊情况处理
+                if episode_len == 0:
+                    if not data:
+                        # 空字典
+                        return []
+                    else:
+                        # 非空字典但没有列表类型的值，可能是单个时间步
+                        # 作为单个样本返回
+                        return [data]
+                
+                # 正常情况：创建结果列表
+                res = [{} for _ in range(episode_len)]
+                
+                for key, value_list in data.items():
+                    try:
+                        unpacked_values = self._unpack(value_list)
+                        
+                        # 检查数据一致性
+                        if len(unpacked_values) != episode_len and episode_len != 0:
+                            # 数据不一致，记录并尝试修复
+                            print(f"Warning: Key {key} has {len(unpacked_values)} items, expected {episode_len}")
+                            
+                            if len(unpacked_values) > 0:
+                                # 有一些值，通过重复或截断来调整长度
+                                if len(unpacked_values) < episode_len:
+                                    # 重复最后一个值
+                                    last_value = unpacked_values[-1]
+                                    unpacked_values.extend([last_value] * (episode_len - len(unpacked_values)))
+                                else:
+                                    # 截断
+                                    unpacked_values = unpacked_values[:episode_len]
+                            else:
+                                # 跳过这个键
+                                continue
+                        
+                        # 填充结果
+                        for i, v_item in enumerate(unpacked_values):
+                            if i < episode_len:  # 安全检查
+                                res[i][key] = v_item
+                    except Exception as e:
+                        # 处理单个键的错误，但不中断整个过程
+                        print(f"Error unpacking key {key}: {e}")
+                        # 跳过这个键
+                        continue
+                
+                return res
+            
+            elif isinstance(data, (list, tuple, deque)):
+                # 确保返回普通列表
+                return list(data)
+            
+            elif isinstance(data, np.ndarray):
+                # 这可能是一个批次的特征，我们希望返回单个样本的列表
+                if data.ndim > 0:
+                    # 多维数组，可能包含多个样本
+                    return [data[i] for i in range(data.shape[0])]
+                else:
+                    # 标量数组
+                    return [data]
+            
+            else:
+                # 单个值（数字、字符串等）
+                try:
+                    # 尝试将其作为可迭代对象
+                    return list(data)
+                except:
+                    # 不可迭代，作为单个元素的列表返回
+                    return [data]
+                    
+        except Exception as e:            # 记录错误并返回空列表
+            print(f"General error in _unpack: {e}")
+            return []
+            
+    def _pack(self, data_list_of_dicts): 
+        """
+        将单独的样本打包成一个批次。
+        递归地处理嵌套字典结构，返回合并后的批次数据。
+        
+        Args:
+            data_list_of_dicts: 要打包的数据列表，通常是一个字典列表
+            
+        Returns:
+            dict/ndarray: 打包后的批次数据
+        """
+        # 处理边缘情况
         if not data_list_of_dicts:
-            return {} # Or handle as an error / return None
-
-        if isinstance(data_list_of_dicts[0], dict):
-            keys = data_list_of_dicts[0].keys()
-            res_dict = {}
-            for key in keys:
-                # Collect all values for this key from each timestep dict in the list
-                values_for_key = [timestep_dict[key] for timestep_dict in data_list_of_dicts]
-                res_dict[key] = self._pack(values_for_key) # Recursively pack these collected values
-            return res_dict
-        # Base case for recursion: list of numbers or ndarrays
-        elif isinstance(data_list_of_dicts[0], np.ndarray):
-            try:
-                return np.stack(data_list_of_dicts)
-            except ValueError as e: # Handle cases where arrays can't be stacked (e.g. different shapes not along axis 0)
-                # print(f"Warning: Could not stack ndarrays for packing, returning as list. Error: {e}")
-                return list(data_list_of_dicts) # Fallback to list of arrays
-        else: # list of numbers, bools, etc.
-            return np.array(data_list_of_dicts)
+            return {}
+        
+        try:
+            # 字典列表：每个字典是一个时间步
+            if isinstance(data_list_of_dicts[0], dict):
+                # 获取所有键，使用集合合并所有可能的键
+                all_keys = set()
+                for d in data_list_of_dicts:
+                    all_keys.update(d.keys())
+                
+                res_dict = {}
+                for key in all_keys:
+                    try:
+                        # 收集该键的所有值，对缺失值使用None
+                        values_for_key = []
+                        for timestep_dict in data_list_of_dicts:
+                            if key in timestep_dict:
+                                values_for_key.append(timestep_dict[key])
+                            else:
+                                # 键缺失，使用None占位
+                                values_for_key.append(None)
+                        
+                        # 递归打包，如果全是None则跳过
+                        if any(v is not None for v in values_for_key):
+                            # 过滤掉None并记录其索引
+                            valid_values = []
+                            valid_indices = []
+                            for i, v in enumerate(values_for_key):
+                                if v is not None:
+                                    valid_values.append(v)
+                                    valid_indices.append(i)
+                            
+                            # 递归处理有效值
+                            if valid_values:
+                                packed_valid = self._pack(valid_values)
+                                
+                                # 如果所有值都有效，直接使用结果
+                                if len(valid_values) == len(values_for_key):
+                                    res_dict[key] = packed_valid
+                                else:
+                                    # 否则需要重建完整列表，填充None的位置
+                                    print(f"Warning: Key {key} has {len(values_for_key) - len(valid_values)} None values")
+                                    # 这里的处理取决于packed_valid的类型
+                                    if isinstance(packed_valid, np.ndarray):
+                                        # 为None值创建适当形状的零数组
+                                        full_shape = list(packed_valid.shape)
+                                        full_shape[0] = len(values_for_key)  # 调整批次维度
+                                        full_array = np.zeros(full_shape, dtype=packed_valid.dtype)
+                                        
+                                        # 将有效值放入对应位置
+                                        for src_idx, dst_idx in enumerate(valid_indices):
+                                            if src_idx < len(packed_valid):  # 安全检查
+                                                full_array[dst_idx] = packed_valid[src_idx]
+                                        
+                                        res_dict[key] = full_array
+                                    else:
+                                        # 对于其他类型（如列表），直接替换
+                                        # 这种情况较少见，因为大多数有效值会被转换为ndarray
+                                        res_dict[key] = packed_valid
+                    except Exception as e:
+                        print(f"Error packing key {key}: {e}")
+                        # 跳过这个键但继续处理其他键
+                        continue
+                
+                return res_dict
+            
+            # 数组的列表：打包成一个大数组
+            elif isinstance(data_list_of_dicts[0], np.ndarray):
+                try:
+                    # 过滤掉所有None值
+                    valid_arrays = [arr for arr in data_list_of_dicts if arr is not None]
+                    if not valid_arrays:
+                        return np.array([])  # 全部是None
+                    
+                    # 检查所有数组的形状是否一致
+                    first_shape = valid_arrays[0].shape
+                    all_same_shape = all(arr.shape == first_shape for arr in valid_arrays)
+                    
+                    if all_same_shape:
+                        # 所有数组形状一致，可以直接堆叠
+                        return np.stack(valid_arrays)
+                    else:
+                        # 形状不一致，尝试使用战略
+                        print(f"Warning: Arrays have inconsistent shapes for stacking")
+                        
+                        # 策略1：使用最常见的形状
+                        from collections import Counter
+                        shapes = [arr.shape for arr in valid_arrays]
+                        most_common_shape = Counter(shapes).most_common(1)[0][0]
+                        
+                        # 只保留符合最常见形状的数组
+                        filtered_arrays = [arr for arr in valid_arrays if arr.shape == most_common_shape]
+                        if filtered_arrays:
+                            return np.stack(filtered_arrays)
+                        else:
+                            # 如果过滤后为空，退回到列表
+                            return valid_arrays
+                except ValueError as e:
+                    print(f"Warning: Could not stack arrays: {e}")
+                    # 退回到列表
+                    return [arr for arr in data_list_of_dicts if arr is not None]
+            
+            # 基本类型列表（数字、布尔值等）：转换为数组
+            else:
+                try:
+                    # 过滤掉None
+                    valid_items = [item for item in data_list_of_dicts if item is not None]
+                    if not valid_items:
+                        return np.array([])  # 全是None
+                    
+                    return np.array(valid_items)
+                except Exception as e:
+                    print(f"Warning: Could not convert to array: {e}")
+                    # 退回到列表
+                    return [item for item in data_list_of_dicts if item is not None]
+                    
+        except Exception as e:
+            print(f"General error in _pack: {e}")
+            # 返回原始列表作为最后的退路
+            return data_list_of_dicts

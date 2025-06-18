@@ -9,11 +9,15 @@ import sys # 用于sys.exit
 
 # 假设这些导入路径相对于您的项目结构是正确的
 from replay_buffer import ReplayBuffer 
-from actor import Actor # Actor 类 
-from learner import Learner # Learner 类 
-from inference_server import InferenceServer # 导入新的 InferenceServer
-from model import ResNet34AC # 导入您的模型类
+from actor.actor import Actor # Actor 类 
+from learner.learner import Learner # Learner 类 
+from inference_server.inference_server import InferenceServer # 导入新的 InferenceServer
 from utils import setup_process_logging_and_tensorboard # 日志和 TensorBoard 设置工具
+
+from models.actor import ResNet34Actor # 导入具体的 Actor 模型
+from models.critic import ResNet34CentralizedCritic # 导入具体的 Critic 模型
+
+from agent.feature import FeatureAgent # 导入 FeatureAgent 类
 
 # --- 全局关闭事件和进程句柄，用于信号处理 ---
 shutdown_event = mp.Event() # 用于通知所有子进程开始关闭的事件
@@ -114,8 +118,8 @@ def cleanup_all_processes(signal_received=None, frame=None):
 CONFIG = {
     # Experiment Meta
     'experiment_name': "Using_Inference_Server", # Use underscores or avoid special chars for dir names
-    'log_base_dir': '/home/dataset-assist-0/data/Mahjong/RL/log', # Base directory for logs and TensorBoard
-    'checkpoint_base_dir': '/home/dataset-assist-0/data/Mahjong/RL/model', # Base directory for checkpoints
+    'log_base_dir': 'log/log', # Base directory for logs and TensorBoard
+    'checkpoint_base_dir': 'log/model', # Base directory for checkpoints
 
     # Data & Replay Buffer
     'replay_buffer_size': 50000,
@@ -123,41 +127,44 @@ CONFIG = {
     'min_sample_to_start_learner': 20000, # Increased wait time based on batch size? Renamed.
 
     # Model & Training
-    'supervised_model_path': '/home/dataset-assist-0/data/Mahjong/RL/supervised_model/best_model.pkl',
+    'supervised_model_path': 'initial_models/actor_from_sl.pth',
     'in_channels': 187,
+    'out_channels': 235,
+    'critic_extra_in_channels': 16,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'agent_clz': FeatureAgent,
 
     # Distributed Setup
-    # 'model_pool_size': 120,
-    # 'model_pool_name': 'model-pool-v2', # Example name
-    'num_actors': 8,
-    'episodes_per_actor': 25000, # How many episodes each actor runs before exiting
+    'num_actors': 12,
+    'num_envs_per_actor': 8,
+    'num_env_steps': 10000000, # Total number of environment steps to run across all actors
 
     # Learner Hyperparameters
     'batch_size': 1024, # Increased batch size
-    'epochs_per_batch': 2, # Renamed 'epochs' for clarity (PPO inner loops)
-
-    ## Learning Rate Scheduler
-    'lr_critic_head': 3e-5,
-    'lr_critic_feature_extractor': 2e-5,
-    'lr_actor_head_finetune': 2e-5,
-    'lr_actor_feature_extractor_finetune': 2e-5,
+    'epochs_per_batch': 2, # Renamed 'epochs' for clarity (PPO inner loops)    ## Learning Rate Scheduler - Updated for new parameter groups
+    'lr_actor': 3e-5,  # Actor overall learning rate
+    'lr_critic_feature_extractor': 3e-4,  # Critic feature_extractor_obs learning rate  
+    'lr_critic_head': 3e-4,  # Critic head (includes feature_extractor_extra + critic_head_mlp) learning rate
     
-    'unfreeze_actor_head_after_iters': 500,
-    'unfreeze_actor_feature_extractor_after_iters': 500,
-
+    # Staged training configuration
+    'stage1_iterations': 10000,  # Only train critic_head group (fe_extra + head_mlp)
+    'stage2_iterations': 50000,  # Unfreeze critic_fe_obs, keep actor frozen
+    # Stage 3 starts at stage2_iterations: joint training of all components
+    
     'use_lr_scheduler': True,
-    "warmup_iterations": 500,
+    # "warmup_iterations": 1000,
     'total_iterations_for_lr_decay': 500000,
-    'initial_lr_warmup_critic': 1e-6,
-    'min_lr_critic_schedule': 1e-6, # Minimum learning rate for scheduler
+    'min_lr_for_scheduled_components': 1e-6,
+    'initial_lr_warmup_actor': 3e-6,
+    'initial_lr_warmup_critic_fe': 3e-6,
+    'initial_lr_warmup_critic_head': 3e-5,
 
     # PPO 基本设置
     'gamma': 0.98,      # Discount factor for GAE/TD Target
     'lambda': 0.97,     # Lambda for GAE
     'clip': 0.2,        # PPO clip epsilon
     'grad_clip_norm': 0.3,
-    'value_coeff': 0.8, # Coefficient for value loss (common to scale down)
+    'value_coeff': 0.5, # Coefficient for value loss (common to scale down)
     'entropy_coeff': -1e-4, # Coefficient for entropy bonus
 
 
@@ -170,9 +177,10 @@ CONFIG = {
     # 多样化 opponent
     'p_opponent_historical' : 0.4,
     "benchmark_policies": {
-        "initial_il_policy": "/home/dataset-assist-0/data/Mahjong/RL/model/Separate_Feature_Extractor/model_iter_249.pt",
+        "initial_il_policy": "initial_models/actor_from_sl.pth",
     },
-    "initial_model_eval_path": "/home/dataset-assist-0/data/Mahjong/RL/model/Separate_Feature_Extractor/model_iter_249.pt",
+    "initial_actor_eval_path": "initial_models/actor_from_sl.pth",
+    "initial_critic_eval_path": "initial_models/centralized_critic_initialized.pth",
     "prob_opponent_is_benchmark": 0.15,
 
     "server_hosted_benchmark_names": ["initial_il_policy"],
@@ -183,14 +191,15 @@ CONFIG = {
 
 
     # Added for potential use in Learner/Actor logging/config
-    'log_interval_learner': 100, # Log Learner stats every N iterations
+    'log_interval_learner': 10, # Log Learner stats every N iterations
+    'log_interval_actor' : 10,
     'model_push_interval': 10,   # Push model every N Learner iterations
-    'enable_profiling': True,
-    'enable_profiling_actor': True,
+    'enable_profiling': False,
+    'enable_profiling_actor': False,
 
     # 关于 inference_server 的相关设置
-    'use_centralize_critic': False,
-    "inference_batch_size": 32,
+    'use_centralize_critic': True,
+    "inference_batch_size": 256,
     "inference_max_wait_ms": 10, # 单位 ms
 }
 
@@ -210,7 +219,7 @@ def main():
 
     try:
         g_main_logger, g_main_writer = setup_process_logging_and_tensorboard(
-            log_base_dir, run_name, process_type='main_train', process_id=os.getpid()
+            log_base_dir, run_name, process_name='main_train', process_id=os.getpid()
         )
     except Exception as e_log_setup:
         logging.error(f"Main process logger/writer setup failed: {e_log_setup}", exc_info=True)
@@ -243,25 +252,32 @@ def main():
         for i in range(CONFIG['num_actors']):
             actor_id_key = f'Actor-{CONFIG.get("actor_id_base", 0) + i}' # 与 Actor 配置中的 name 保持一致
             server_to_actors_resp_qs[actor_id_key] = mp.Queue()
-        g_main_logger.info("Communication queues for InferenceServer created.")
-
-        # 2. 准备 InferenceServer 配置
+        g_main_logger.info("Communication queues for InferenceServer created.")        # 2. 准备 InferenceServer 配置
         benchmark_models_info_for_server = {}
-        # 示例：从主配置中获取一个基准模型信息 (如果存在)
-        # if CONFIG.get('supervised_model_path') and os.path.isfile(CONFIG['supervised_model_path']):
-        benchmark_models_info_for_server["initial_il_policy"] = {"path": CONFIG['initial_model_eval_path']}
-        # 您可以在这里添加更多基准模型到 benchmark_models_info_for_server
+        # 从 benchmark_policies 配置中获取基准模型信息
+        for policy_name, policy_path in CONFIG.get('benchmark_policies', {}).items():
+            if policy_path and os.path.isfile(policy_path):
+                benchmark_models_info_for_server[policy_name] = {"path": policy_path}
+                g_main_logger.info(f"Added benchmark model '{policy_name}' from path: {policy_path}")
+            else:
+                g_main_logger.warning(f"Benchmark model path not found: {policy_path} for policy '{policy_name}'")
         
         server_config = {
             'name': 'InferenceServer-Main', # 服务器进程的名称
-            'evaluator_id': f"inference_server_{os.getpid()}", # 给服务器一个唯一ID，用于日志
+            'server_id': f"inference_server_{os.getpid()}", # 给服务器一个唯一ID，用于日志
             'log_base_dir': CONFIG['log_base_dir'],
             'experiment_name': CONFIG['experiment_name'],
             'in_channels': CONFIG['in_channels'],
+            'out_channels': CONFIG['out_channels'],
+            'critic_extra_in_channels': CONFIG.get('critic_extra_in_channels', 16),
             'device': CONFIG['device'], # InferenceServer 将模型加载到哪个设备
-            'initial_model_eval_path': CONFIG.get('initial_model_eval_path'), # 初始训练模型的路径
+            'initial_actor_eval_path': CONFIG.get('initial_actor_eval_path'), # 初始 Actor 模型的路径
+            'initial_critic_eval_path': CONFIG.get('initial_critic_eval_path'), # 初始 Critic 模型的路径
             'benchmark_models_info': benchmark_models_info_for_server, # 要托管的基准模型
-            'model_definition_class': ResNet34AC # 传递实际的模型类
+            'actor_class': ResNet34Actor,
+            'critic_class': ResNet34CentralizedCritic,
+            'inference_batch_size': CONFIG.get('inference_batch_size', 32),
+            'inference_max_wait_ms': CONFIG.get('inference_max_wait_ms', 10)
         }
         g_main_logger.info("InferenceServer configuration prepared.")
 
@@ -300,9 +316,10 @@ def main():
         learner_config['ckpt_save_path'] = checkpoint_dir # 传递检查点保存路径
         learner_config['shutdown_event'] = shutdown_event # 传递关闭事件
         learner_config['inference_server_cmd_queue'] = g_learner_to_server_cmd_q # 传递命令队列
+        # learner_config['critic_extra_in_channels'] = CONFIG.get('critic_extra_in_channels', 16) # 传递 Critic 的额外输入通道数
         # Learner 不再需要旧的 ModelPool 配置 (如果完全依赖 InferenceServer)
-        learner_config.pop('model_pool_name', None) 
-        learner_config.pop('model_pool_size', None)
+        # learner_config.pop('model_pool_name', None) 
+        # learner_config.pop('model_pool_size', None)
         # Learner 需要知道模型同步间隔
         learner_config['model_sync_interval'] = CONFIG.get('model_sync_interval_learner', 10)
 
@@ -335,6 +352,9 @@ def main():
             actor_config['inference_server_resp_queue'] = server_to_actors_resp_qs[actor_name_key] # 专属的响应队列
             # Actors 也不再需要旧的 ModelPool 配置 (如果完全依赖 InferenceServer)
             actor_config.pop('model_pool_name', None)
+            actor_config['env_config'] = {
+                'agent_clz': CONFIG['agent_clz'], # 指定环境内部使用的 Agent 类
+            }
 
             actor = Actor(actor_config, replay_buffer)
             g_actor_processes.append(actor)
