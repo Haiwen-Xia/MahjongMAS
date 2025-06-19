@@ -11,3 +11,5 @@
 **/tensorboard_logs
 **/*.json
 **/*.gz
+**/*.pth
+**/*.sh

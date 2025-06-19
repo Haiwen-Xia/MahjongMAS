@@ -158,16 +158,10 @@ class PPOAlgorithm:
         
         # 为不同组件分别计算学习率，考虑到解冻时间
         # 1. Actor的学习率：如果还未解冻，考虑将'iterations'重置为0，或较小值，保证解冻时有足够大的学习率
-        actor_effective_iter = iterations
-        if iterations <= stage2_iters:
-            # Actor在stage2_iters之前被冻结，解冻后应该使用较高的学习率开始训练
-            actor_effective_iter = max(0, iterations - stage2_iters)  # 相对于解冻时刻的迭代次数
+        actor_effective_iter = max(0, iterations - stage2_iters)  # 相对于解冻时刻的迭代次数
             
         # 2. Critic特征提取器的学习率：类似地，考虑解冻时间
-        critic_fe_effective_iter = iterations
-        if iterations <= stage1_iters:
-            # Critic FE在stage1_iters之前被冻结
-            critic_fe_effective_iter = max(0, iterations - stage1_iters)  # 相对于解冻时刻的迭代次数
+        critic_fe_effective_iter = max(0, iterations - stage1_iters)  # 相对于解冻时刻的迭代次数
             
         # 3. Critic头部始终训练，使用正常迭代次数
         critic_head_effective_iter = iterations
@@ -206,6 +200,13 @@ class PPOAlgorithm:
         states = {'obs': {'observation': obs, 'action_mask': mask}}
         actions = torch.tensor(batch['action'], dtype=torch.long).unsqueeze(-1).to(self.device, non_blocking=True)   
         advs = torch.tensor(batch['adv']).to(self.device, non_blocking=True)
+
+        adv_norm_flag = self.config.get("normalize_adv",True)
+        if adv_norm_flag:
+            advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+        else:
+            self.logger.warning("Advantages normalization is disabled.")
+
         targets = torch.tensor(batch['target']).to(self.device, non_blocking=True)
         old_log_probs_from_buffer = torch.tensor(batch['log_prob']).to(self.device, non_blocking=True)
         global_obs_data = batch['state']['global_obs']

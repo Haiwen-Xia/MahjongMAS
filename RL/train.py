@@ -12,7 +12,7 @@ from replay_buffer import ReplayBuffer
 from actor.actor import Actor # Actor 类 
 from learner.learner import Learner # Learner 类 
 from inference_server.inference_server import InferenceServer # 导入新的 InferenceServer
-from utils import setup_process_logging_and_tensorboard # 日志和 TensorBoard 设置工具
+from utils import setup_process_logging_and_tensorboard, save_experiment_config # 日志和 TensorBoard 设置工具
 
 from models.actor import ResNet34Actor # 导入具体的 Actor 模型
 from models.critic import ResNet34CentralizedCritic # 导入具体的 Critic 模型
@@ -119,7 +119,7 @@ CONFIG = {
     # 实验元数据
     'experiment_meta': {
         'experiment_name': "Using_Inference_Server", # Use underscores or avoid special chars for dir names
-        'log_base_dir': 'log/log', # Base directory for logs and TensorBoard
+        'log_base_dir': 'logs', # Base directory for logs and TensorBoard
         'checkpoint_base_dir': 'log/model', # Base directory for checkpoints
     },
     
@@ -166,12 +166,13 @@ CONFIG = {
 
         # 多样化 opponent
         'p_opponent_historical' : 0.05,
-        'prob_opponent_is_benchmark': 0.4,
-        'opponent_model_change_interval': 10, # 每多少个 episode 替换一次对手
+        'p_opponent_benchmark': 1,
+        'opponent_model_change_interval': 500, # 每多少个 episode 替换一次对手
 
         # 收集数据处理
         'filter_single_action_steps': False, # [Deprecated] 是否过滤掉只有单个可能 action 的时间步
         'use_normalized_reward': True,
+        'draw_reward': -0.5,
 
         'inference_timeout_seconds': 5, 
     },
@@ -181,7 +182,7 @@ CONFIG = {
         'log_interval': 100, 
         'model_push_interval': 10,
         'ckpt_save_interval_seconds': 600, # 保存检查点的间隔时间
-        'min_sample_to_start_learner': 20000, # 开始训练需要的 buffer 样本数
+        'min_sample_to_start_learner': 20, # 开始训练需要的 buffer 样本数
         'training_components_log_freq': 1000,  # 训练组件状态日志频率
     },
 
@@ -192,9 +193,10 @@ CONFIG = {
         'clip': 0.2,        # PPO clip epsilon
         'grad_clip_norm': 0.3,
         'value_coeff': 0.5, # Coefficient for value loss (common to scale down)
-        'entropy_coeff': -1e-4, # Coefficient for entropy bonus 正常是正数，但这里是负数表示惩罚
+        'entropy_coeff': -1e-3, # Coefficient for entropy bonus 正常是正数，但这里是负数表示惩罚
         'batch_size': 1024, # Increased batch size
         'epochs_per_batch': 5, # Renamed 'epochs' for clarity (PPO inner loops)
+        'normalize_adv': True,
 
 
         # Learner Hyperparameters        'lr_actor': 3e-5,  # Actor overall learning rate
@@ -210,8 +212,8 @@ CONFIG = {
         'initial_lr_warmup_critic_fe': 3e-6,
         'initial_lr_warmup_critic_head': 3e-5,
         # Staged training configuration
-        'stage1_iterations': 10000,  # Only train critic_head group (fe_extra + head_mlp)
-        'stage2_iterations': 50000,  # Unfreeze critic_fe_obs, keep actor frozen
+        'stage1_iterations': 1000,  # Only train critic_head group (fe_extra + head_mlp)
+        'stage2_iterations': 2000,  # Unfreeze critic_fe_obs, keep actor frozen
         # Stage 3 starts at stage2_iterations: joint training of all components
     },
 
@@ -234,16 +236,22 @@ def main():
     )
     
     run_name = CONFIG['experiment_meta']['experiment_name']
-    log_base_dir = CONFIG['experiment_meta']['log_base_dir']
+    log_base_dir = CONFIG['experiment_meta']['log_base_dir']  #logs
 
     try:
-        g_main_logger, g_main_writer = setup_process_logging_and_tensorboard(
-            log_base_dir, run_name, process_name='main_train', process_id=os.getpid()
+        # 使用新的日志设置函数
+        g_main_logger, g_main_writer, main_log_paths = setup_process_logging_and_tensorboard(
+            log_base_dir, CONFIG, process_name='main_train', log_type='main'
         )
+        
+        # 保存实验配置
+        save_experiment_config(CONFIG, main_log_paths['config_save_path'])
+        
     except Exception as e_log_setup:
         logging.error(f"Main process logger/writer setup failed: {e_log_setup}", exc_info=True)
         g_main_logger = logging.getLogger("main_fallback_logger") # 使用一个备用logger，以防万一
         g_main_writer = None # Writer 可能无法创建
+        main_log_paths = {'checkpoint_dir': 'log/model'}  # 提供默认路径
 
     # 设置信号处理器
     original_sigint_handler = signal.getsignal(signal.SIGINT) # 保存原始的 SIGINT 处理器
@@ -258,8 +266,8 @@ def main():
     # --- 核心训练流程 ---
     try:
         g_main_logger.info("="*60)
-        g_main_logger.info(f"Starting Experiment: {run_name} (Main Process PID: {os.getpid()})")
-        g_main_logger.info(f"Full Configuration:\n{json.dumps(CONFIG, indent=2, default=str, ensure_ascii=False)}") # default=str 处理无法序列化的对象
+        g_main_logger.info(f"Starting Experiment: {CONFIG['experiment_meta']['experiment_name']} (Main Process PID: {os.getpid()})")
+        g_main_logger.info(f"Log paths: {main_log_paths}")
         g_main_logger.info("="*60)
 
         # 1. 创建 InferenceServer 通信队列
@@ -321,7 +329,7 @@ def main():
         g_main_logger.info("Replay Buffer initialized.")
 
         # 5. 准备并启动 Learner
-        checkpoint_dir = os.path.join(CONFIG['experiment_meta']['checkpoint_base_dir'], run_name)
+        checkpoint_dir = main_log_paths['checkpoint_dir']  # 使用新的路径
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         learner_config = CONFIG['learner_config'].copy() # 为 Learner 创建配置副本
@@ -332,6 +340,7 @@ def main():
         learner_config['ckpt_save_path'] = checkpoint_dir # 传递检查点保存路径
         learner_config['shutdown_event'] = shutdown_event # 传递关闭事件
         learner_config['inference_server_cmd_queue'] = g_learner_to_server_cmd_q # 传递命令队列
+        learner_config['log_base_dir'] = log_base_dir
 
 
         g_main_logger.info("Initializing Learner...")
@@ -368,6 +377,16 @@ def main():
             actor_config['shutdown_event'] = shutdown_event # 传递关闭事件
             actor_config['inference_server_req_queue'] = actors_to_server_req_q # 推理请求队列
             actor_config['inference_server_resp_queue'] = server_to_actors_resp_qs[actor_name_key] # 专属的响应队列
+            actor_config['log_base_dir'] = log_base_dir # 日志目录
+                        # 简化：只为Actor-0在主TensorBoard中记录指标，避免多进程写入冲突
+            # 其他Actor只写入自己的detailed TensorBoard
+            if actor_id_val == 0:  # 只有Actor-0写入主TensorBoard
+                main_tensorboard_dir = os.path.join(main_log_paths['main_experiment_dir'], 'tensorboard', 'main_train')
+                actor_main_tb_path = os.path.join(main_tensorboard_dir, 'Actor-0')
+                actor_config['actor_main_tensorboard_path'] = actor_main_tb_path
+            else:
+                # 其他Actor不写入主TensorBoard
+                actor_config['actor_main_tensorboard_path'] = None
 
             actor = Actor(actor_config, replay_buffer)
             g_actor_processes.append(actor)
@@ -379,17 +398,85 @@ def main():
 
         # --- 7. 等待进程结束 (主训练循环对于 train.py 来说就是等待) ---
         g_main_logger.info("Main process is now waiting for Actor processes to complete their configured episodes (or until a shutdown signal is received)...")
+        
+        # 记录训练开始的重要信息
+        total_env_steps = CONFIG['actor_config']['num_env_steps'] 
+        actors_count = CONFIG['num_actors']
+        envs_per_actor = CONFIG['actor_config']['num_envs_per_actor']
+        total_parallel_envs = actors_count * envs_per_actor
+        
+        g_main_logger.info(f"🚀 TRAINING_START | Target: {total_env_steps:,} steps | "
+                          f"Parallel Envs: {total_parallel_envs} ({actors_count} actors × {envs_per_actor} envs) | "
+                          f"Expected Duration: ~{total_env_steps / (total_parallel_envs * 60):.1f} hours")
+        
+        # 监控变量
+        training_start_time = time.time()  # 记录训练开始时间
+        last_status_time = time.time()
+        status_interval = 60  # 每60秒输出一次状态
+        
         for actor in g_actor_processes:
             while actor.is_alive(): # 只要 actor 还在运行
                 if shutdown_event.is_set(): # 检查是否收到了关闭信号
                     g_main_logger.info(f"Main process detected shutdown_event, no longer actively waiting for Actor {actor.name}.")
                     break # 跳出对此 actor 的等待
+                
+                # 定期输出训练状态
+                current_time = time.time()
+                if current_time - last_status_time >= status_interval:
+                    try:
+                        # 获取ReplayBuffer状态
+                        buffer_size = replay_buffer.size()
+                        buffer_episodes = replay_buffer.queue.qsize() if hasattr(replay_buffer, 'queue') and hasattr(replay_buffer.queue, 'qsize') else 'N/A'
+                        
+                        # 检查进程状态
+                        learner_status = "RUNNING" if g_learner_process and g_learner_process.is_alive() else "STOPPED"
+                        server_status = "RUNNING" if g_inference_server_process and g_inference_server_process.is_alive() else "STOPPED"
+                        alive_actors = sum(1 for a in g_actor_processes if a.is_alive())
+                        
+                        elapsed_minutes = (current_time - training_start_time) / 60
+                        estimated_progress = min(buffer_size / total_env_steps * 100, 100) if total_env_steps > 0 else 0
+                        
+                        g_main_logger.info(f"📊 TRAINING_STATUS | ReplayBuffer: {buffer_size:,} steps ({buffer_episodes} episodes) | "
+                                         f"Processes: Learner={learner_status}, Server={server_status}, Actors={alive_actors}/{len(g_actor_processes)} | "
+                                         f"Runtime: {elapsed_minutes:.1f}min | Progress: {estimated_progress:.1f}%")
+                        
+                        # 记录主要状态到TensorBoard
+                        if g_main_writer:
+                            try:
+                                g_main_writer.add_scalar('System/ReplayBuffer_Size', buffer_size, int(elapsed_minutes * 60))
+                                g_main_writer.add_scalar('System/Training_Progress_Percent', estimated_progress, int(elapsed_minutes * 60))
+                                g_main_writer.add_scalar('System/Active_Actors', alive_actors, int(elapsed_minutes * 60))
+                                g_main_writer.flush()
+                            except Exception as e_main_tb:
+                                g_main_logger.warning(f"Failed to write system metrics to main TensorBoard: {e_main_tb}")
+                        
+                        last_status_time = current_time
+                    except Exception as e_status:
+                        g_main_logger.warning(f"Error collecting training status: {e_status}")
+                
                 actor.join(timeout=1.0) # 带超时的 join，允许主进程周期性地检查 shutdown_event
             if not shutdown_event.is_set() and not actor.is_alive(): # 如果 actor 正常结束
-                 g_main_logger.info(f"Actor {actor.name} (PID: {actor.pid if actor.pid else 'N/A'}) has finished its episodes.")
+                 g_main_logger.info(f"✅ ACTOR_COMPLETED | {actor.name} (PID: {actor.pid if actor.pid else 'N/A'}) has finished its episodes.")
+        
+        # 训练完成统计
+        total_training_time = (time.time() - training_start_time) / 60
+        final_buffer_size = replay_buffer.size()
         
         if not shutdown_event.is_set(): # 如果不是因为外部信号中断的 (即所有 Actors 都正常完成了)
-            g_main_logger.info("All Actor processes have completed their tasks.")
+            g_main_logger.info(f"🎯 TRAINING_COMPLETED | All Actor processes have completed their tasks. | "
+                              f"Total Runtime: {total_training_time:.1f}min | "
+                              f"Final Buffer Size: {final_buffer_size:,} steps")
+            
+            # 记录训练完成指标到TensorBoard
+            if g_main_writer:
+                try:
+                    g_main_writer.add_scalar('Training/Total_Runtime_Minutes', total_training_time, final_buffer_size)
+                    g_main_writer.add_scalar('Training/Final_Buffer_Size', final_buffer_size, final_buffer_size)
+                    g_main_writer.add_scalar('Training/Completion_Status', 1.0, final_buffer_size)  # 1.0 表示正常完成
+                    g_main_writer.flush()
+                except Exception as e_final_tb:
+                    g_main_logger.warning(f"Failed to write completion metrics to main TensorBoard: {e_final_tb}")
+                    
             g_main_logger.info("Signaling Learner and InferenceServer to shut down gracefully...")
             shutdown_event.set() # 通知 Learner 优雅关闭
             if g_learner_to_server_cmd_q: # 通知 InferenceServer 优雅关闭

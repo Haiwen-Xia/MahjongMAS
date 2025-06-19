@@ -197,12 +197,13 @@ class InferenceServer(mp.Process):
 
     def _setup_logging(self):
         """初始化日志记录器和 TensorBoard writer。"""
-        log_base_dir = self.config.get('log_base_dir', './logs') 
-        experiment_name = self.config.get('experiment_name', 'default_experiment') 
+        # 根据配置决定使用主要日志还是详细日志
+        log_type = 'detailed' if self.config.get('enable_detailed_logging', True) else 'main'
+        
         try:
-            # 使用与 actor.py 相同的调用方式
-            self.logger, self.writer = setup_process_logging_and_tensorboard(
-                log_base_dir, experiment_name, self.name
+            # 使用新的日志设置函数
+            self.logger, self.writer, server_log_paths = setup_process_logging_and_tensorboard(
+                self.config['log_base_dir'], self.config, self.name, log_type=log_type
             )
         except Exception as e_log:
             print(f"CRITICAL [{self.name}]: Failed to initialize logger/writer via setup_tool: {e_log}")

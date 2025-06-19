@@ -52,6 +52,7 @@ class Actor(Process):
         # 最好在 run() 方法中初始化
         self.logger = None
         self.writer = None
+        self.detailed_writer = None  # 新增：详细日志的writer
 
         self.inference_req_queue = config.get('inference_server_req_queue')
         self.inference_resp_queue = config.get('inference_server_resp_queue') 
@@ -82,6 +83,14 @@ class Actor(Process):
         else:
             print(f"[{self.name}] Will be able to request server-hosted benchmarks: {self.server_hosted_benchmark_names}")
 
+        # 修改统计变量：删除win_count，保留draw_count用于计算draw_rate
+        self.draw_count = 0  # 平局次数
+        self.total_episodes = 0  # 总episode数
+        self.win_rate_window_size = config.get('win_rate_window_size', 100)  # 运行平均窗口大小
+        self.recent_results = []  # 最近的胜负结果列表，用于计算running mean
+        self.current_win_rate = 0.0  # 当前胜率
+        self.current_draw_rate = 0.0  # 当前平局率
+
     def _prepare_data_for_buffer(self, agent_name: str, agent_data: dict):
         """
         为单个 agent 的一局完整数据计算 GAE 和 TD-Target，并打包成适合 push 到 Replay Buffer 的格式。
@@ -97,7 +106,8 @@ class Actor(Process):
         """
         T = len(agent_data.get('action', []))
         if T == 0:
-            self.logger.debug(f"No actions recorded for Env {agent_name}. Skipping GAE/push.")
+            if self.logger:
+                self.logger.debug(f"No actions recorded for Env {agent_name}. Skipping GAE/push.")
             return None
 
         # 1. 验证数据一致性
@@ -105,13 +115,15 @@ class Actor(Process):
         required_keys = ['observation', 'action_mask', 'global_obs'] # state 的子键
         for key in required_keys:
             if len(agent_data.get('state', {}).get(key, [])) != T:
-                self.logger.error(f"Data Mismatch for {agent_name}: actions len({T}) != state.{key} len({len(agent_data.get('state', {}).get(key, []))}).")
+                if self.logger:
+                    self.logger.error(f"Data Mismatch for {agent_name}: actions len({T}) != state.{key} len({len(agent_data.get('state', {}).get(key, []))}).")
                 return None
         
         required_keys = ['reward', 'value', 'log_prob'] # 顶层键
         for key in required_keys:
             if len(agent_data.get(key, [])) != T:
-                self.logger.error(f"Data Mismatch for {agent_name}: actions len({T}) != {key} len({len(agent_data.get(key, []))}).")
+                if self.logger:
+                    self.logger.error(f"Data Mismatch for {agent_name}: actions len({T}) != {key} len({len(agent_data.get(key, []))}).")
                 return None        # 2. 将数据转换为 NumPy 数组
         try:
             obs_np = np.stack(agent_data['state']['observation'])
@@ -123,7 +135,8 @@ class Actor(Process):
             log_probs_np = np.array(agent_data['log_prob'], dtype=np.float32)
             
         except ValueError as e:
-            self.logger.error(f"Error stacking data for {agent_name}: {e}. Shapes might be inconsistent.", exc_info=True)
+            if self.logger:
+                self.logger.error(f"Error stacking data for {agent_name}: {e}. Shapes might be inconsistent.", exc_info=True)
             return None
         
         # 3. 计算 GAE 和 TD-Target
@@ -167,7 +180,8 @@ class Actor(Process):
         try:
             self.replay_buffer.push(data_to_push)
         except Exception as e:
-            self.logger.error(f"Error pushing data to replay buffer: {e}", exc_info=True)
+            if self.logger:
+                self.logger.error(f"Error pushing data to replay buffer: {e}", exc_info=True)
 
     def _init_episode_data_single_buffer(self, env_idx: int) -> dict:
         agent_names = self.config.get('agent_names', DEFAULT_AGENT_NAMES_LIST)
@@ -185,7 +199,8 @@ class Actor(Process):
         为所有并行环境初始化临时数据缓冲区。
         每个环境一个，用于存储当前 episode 的轨迹。
         """
-        self.logger.info(f"Initializing temporary data buffers for {num_envs} parallel environments.")
+        if self.logger:
+            self.logger.info(f"Initializing temporary data buffers for {num_envs} parallel environments.")
         # 每个缓冲区将存储一个 episode 的 (s, a, v, lp, r) 等信息
         # 结构: [{'state': {'obs':[], 'mask':[]}, 'action': [], ...}, {...}, ...]
         # 我们为每个并行环境创建一个这样的字典
@@ -270,6 +285,34 @@ class Actor(Process):
                 # 获取 agent 的奖励用于日志记录
                 agent_names = self.config.get('agent_names', DEFAULT_AGENT_NAMES_LIST)
 
+                main_agent_idx = self.main_agent_idxs[i]  # 获取当前环境的主智能体索引
+                # print(main_agent_idx)
+                main_agent_name = agent_names[main_agent_idx] if main_agent_idx is not None else 'unknown'
+
+                main_agent_reward = episode_raw_reward_dict.get(main_agent_name, 0.0)
+
+
+                self.total_episodes += 1
+                game_result = self._determine_game_result(episode_raw_reward_dict, main_agent_name)
+                
+                if game_result == 'win':
+                    result_value = 1.0
+                elif game_result == 'draw':
+                    self.draw_count += 1
+                    result_value = 0.2
+                else:  # loss
+                    result_value = 0.0
+
+                # 更新运行平均胜率
+                self.recent_results.append(result_value)
+                if len(self.recent_results) > self.win_rate_window_size:
+                    self.recent_results.pop(0)  # 移除最旧的结果
+                
+                # 计算当前胜率（包括平局算0.2分）和平局率
+                self.current_win_rate = sum(self.recent_results) / len(self.recent_results) if self.recent_results else 0.0
+                self.current_draw_rate = self.draw_count / self.total_episodes if self.total_episodes > 0 else 0.0
+
+
                 sum_raw_rewards_for_latest_policy = 0
                 for agent_name, agent_data in episode_buffers[i].items():
                     if env_policy_keys[i].get(agent_name) == 'latest_eval':
@@ -283,6 +326,7 @@ class Actor(Process):
                                 f"in {episode_step_count} steps ({episode_duration:.2f}s). "
                                 f"Total Raw Reward for Latest Agent: {sum_raw_rewards_for_latest_policy:.2f}. "
                                 f"Reward String ({reward_string}), Policies: {policy_string}"
+                                f"Result: {game_result}, Win Rate: {self.current_win_rate:.3f}"
                                 )
                 
                 # 1. 获取这个完成的 episode 的数据
@@ -310,7 +354,7 @@ class Actor(Process):
                             else:
                                 transformed_scores_ordered[idx] = -1.0
                         else:
-                            transformed_scores_ordered[idx] = 0.0
+                            transformed_scores_ordered[idx] = self.config.get('draw_reward', -0.5)
                     
                     self.logger.debug(f"  Raw scores: {list(zip(agent_names, raw_scores_ordered))}")
                     self.logger.debug(f"  Transformed scores: {list(zip(agent_names, transformed_scores_ordered))}")
@@ -325,8 +369,12 @@ class Actor(Process):
                 # 3. TensorBoard记录
                 if self.writer:
                     try:
+                        self.writer.add_scalar(f'Actor_{self.name}/Reward/MainAgentRawEp', main_agent_reward, total_actor_steps)
                         self.writer.add_scalar(f'Actor_{self.name}/Episode/Length', episode_step_count, total_actor_steps)
                         self.writer.add_scalar(f'Actor_{self.name}/Episode/Duration', episode_duration, total_actor_steps)
+                        self.writer.add_scalar(f'Actor_{self.name}/WinRate/Current', self.current_win_rate, total_actor_steps)
+                        self.writer.add_scalar(f'Actor_{self.name}/WinRate/TotalEpisodes', self.total_episodes, total_actor_steps)
+                        self.writer.add_scalar(f'Actor_{self.name}/DrawRate/Current', self.current_draw_rate, total_actor_steps)
                         
                         # 记录每个agent的原始奖励
                         for ag_name, raw_score in episode_raw_reward_dict.items():
@@ -336,8 +384,21 @@ class Actor(Process):
                         
                         self.writer.flush()
                     except Exception as e:
-                        self.logger.warning(f"Actor {self.name}: Failed to write to TensorBoard: {e}", exc_info=True)
+                        self.logger.warning(f"Actor {self.name}: Failed to write to detailed TensorBoard: {e}", exc_info=True)
 
+                # 4. 主要指标记录到main writer（核心指标）
+                if self.main_writer:
+                    try:
+                        # 只记录最重要的指标到主TensorBoard
+                        self.main_writer.add_scalar(f'Training/Episode_Reward_{self.name}', main_agent_reward, total_actor_steps)
+                        self.main_writer.add_scalar(f'Training/WinRate_{self.name}', self.current_win_rate, total_actor_steps)
+                        self.main_writer.add_scalar(f'Training/Episode_Length_{self.name}', episode_step_count, total_actor_steps)
+                        self.main_writer.add_scalar(f'Training/Draw_Rate_{self.name}', self.current_draw_rate, total_actor_steps)
+                        
+                        self.main_writer.flush()
+                    except Exception as e:
+                        self.logger.warning(f"Actor {self.name}: Failed to write to main TensorBoard: {e}", exc_info=True)
+                
                 # 4. 准备数据 (计算 GAE) 并推送到 Replay Buffer
                 for agent_name, agent_data in completed_episode_data.items():
                     # 只有使用了 "latest_eval" 策略的 agent 的数据才会被用于训练
@@ -498,7 +559,11 @@ class Actor(Process):
 
             current_agent_seat_idx = np.random.randint(0, 4) # 随机选择一个座位作为主智能体
 
+            self.main_agent_idxs[env_to_update] = current_agent_seat_idx
+
             p = np.random.random((4,))
+
+
             p_historical = self.config.get('p_opponent_historical', 0.15) # 从配置中获取概率
             p_benchmark = self.config.get('p_opponent_benchmark', 0.4) # 从配置中获取概率
 
@@ -531,9 +596,19 @@ class Actor(Process):
         8. 定期 更新本地模型。
         """
         # --- 初始化日志和 TensorBoard ---
-        self.logger, self.writer = setup_process_logging_and_tensorboard(
-            self.config['log_base_dir'], self.config['experiment_name'], self.name
+        # 创建主要日志和详细日志的writer
+        self.logger, self.writer, actor_log_paths = setup_process_logging_and_tensorboard(
+            self.config['log_base_dir'], self.config, self.name, log_type='detailed'
         )
+        
+        # 同时创建主要日志的writer，用于记录核心指标
+        try:
+            self.main_logger, self.main_writer, main_log_paths = setup_process_logging_and_tensorboard(
+                self.config['log_base_dir'], self.config, self.name, log_type='main'
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to setup main TensorBoard writer: {e}")
+            self.main_writer = None
 
         # --- 新增：在 run() 方法内部初始化线程相关对象 ---
         self.pending_requests_lock = threading.Lock()
@@ -609,6 +684,7 @@ class Actor(Process):
         # --- 对手选择参数 ---        # policies 字典现在存储每个并行环境的策略分配
         # 结构: {env_idx: {'player_0': 'model_key', 'player_1': 'model_key', ...}}
         env_policy_keys = [{} for _ in range(num_envs_per_actor)]
+        self.main_agent_idxs = [None] * num_envs_per_actor # 用于跟踪每个环境的主智能体索引
         
 
         for i in range(num_envs_per_actor):
@@ -825,3 +901,34 @@ class Actor(Process):
                 results.append((0, 0.0, 0.0))
         
         return results
+
+    def _determine_game_result(self, episode_raw_reward_dict: dict, main_agent_name: str) -> str:
+        """
+        根据原始奖励字典判断一局游戏的结果。
+
+        Args:
+            episode_raw_reward_dict (dict): 包含每个agent原始奖励的字典。
+            main_agent_name (str): 主要agent的名称，用于结果判断。
+
+        Returns:
+            str: 游戏结果，可能的值有 'win', 'loss', 'draw'。
+        """
+        main_agent_reward = episode_raw_reward_dict.get(main_agent_name, 0.0)
+        all_rewards = list(episode_raw_reward_dict.values())
+        
+        # 获取所有玩家的奖励并排序
+        sorted_rewards = sorted(all_rewards, reverse=True)
+        
+        # 判断平局：主要agent的得分与其他玩家相同的情况
+        if main_agent_reward == sorted_rewards[0] and sorted_rewards.count(sorted_rewards[0]) > 1:
+            # 如果主要agent获得最高分但有多人并列第一，算作平局
+            return 'draw'
+        elif main_agent_reward == 0 and all(reward <= 0 for reward in all_rewards):
+            # 如果所有人得分都不为正，且主要agent得分为0，算作平局
+            return 'draw'
+        elif main_agent_reward > 0:
+            # 主要agent获得正分，算作胜利
+            return 'win'
+        else:
+            # 主要agent得分为负或0（且不满足平局条件），算作失败
+            return 'loss'
