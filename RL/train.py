@@ -116,91 +116,110 @@ def cleanup_all_processes(signal_received=None, frame=None):
 # --- Configuration ---
 # It's often better to load config from a file (e.g., YAML, JSON) or use argparse
 CONFIG = {
-    # Experiment Meta
-    'experiment_name': "Using_Inference_Server", # Use underscores or avoid special chars for dir names
-    'log_base_dir': 'log/log', # Base directory for logs and TensorBoard
-    'checkpoint_base_dir': 'log/model', # Base directory for checkpoints
+    # 实验元数据
+    'experiment_meta': {
+        'experiment_name': "Using_Inference_Server", # Use underscores or avoid special chars for dir names
+        'log_base_dir': 'log/log', # Base directory for logs and TensorBoard
+        'checkpoint_base_dir': 'log/model', # Base directory for checkpoints
+    },
+    
+    # Model & Agent 设置
+    'model_agent_config' : {
+        'in_channels': 187,
+        'out_channels': 235,
+        'critic_extra_in_channels': 16,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'actor_class': ResNet34Actor, # 指定 Actor 模型类
+        'critic_class': ResNet34CentralizedCritic, # 指定 Critic 模
+        'agent_clz': FeatureAgent, # 指定环境内部使用的 Agent 类
+        'initial_actor_eval_path': "initial_models/actor_from_sl.pth",
+        'initial_critic_eval_path': "initial_models/centralized_critic_initialized.pth",
+    },
 
-    # Data & Replay Buffer
+    # Replay Buffer 设置
     'replay_buffer_size': 50000,
     'replay_buffer_episode_capacity': 400, # Renamed for clarity
-    'min_sample_to_start_learner': 20000, # Increased wait time based on batch size? Renamed.
 
-    # Model & Training
-    'supervised_model_path': 'initial_models/actor_from_sl.pth',
-    'in_channels': 187,
-    'out_channels': 235,
-    'critic_extra_in_channels': 16,
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'agent_clz': FeatureAgent,
-
-    # Distributed Setup
-    'num_actors': 12,
-    'num_envs_per_actor': 8,
-    'num_env_steps': 10000000, # Total number of environment steps to run across all actors
-
-    # Learner Hyperparameters
-    'batch_size': 1024, # Increased batch size
-    'epochs_per_batch': 2, # Renamed 'epochs' for clarity (PPO inner loops)    ## Learning Rate Scheduler - Updated for new parameter groups
-    'lr_actor': 3e-5,  # Actor overall learning rate
-    'lr_critic_feature_extractor': 3e-4,  # Critic feature_extractor_obs learning rate  
-    'lr_critic_head': 3e-4,  # Critic head (includes feature_extractor_extra + critic_head_mlp) learning rate
-    
-    # Staged training configuration
-    'stage1_iterations': 10000,  # Only train critic_head group (fe_extra + head_mlp)
-    'stage2_iterations': 50000,  # Unfreeze critic_fe_obs, keep actor frozen
-    # Stage 3 starts at stage2_iterations: joint training of all components
-    
-    'use_lr_scheduler': True,
-    # "warmup_iterations": 1000,
-    'total_iterations_for_lr_decay': 500000,
-    'min_lr_for_scheduled_components': 1e-6,
-    'initial_lr_warmup_actor': 3e-6,
-    'initial_lr_warmup_critic_fe': 3e-6,
-    'initial_lr_warmup_critic_head': 3e-5,
-
-    # PPO 基本设置
-    'gamma': 0.98,      # Discount factor for GAE/TD Target
-    'lambda': 0.97,     # Lambda for GAE
-    'clip': 0.2,        # PPO clip epsilon
-    'grad_clip_norm': 0.3,
-    'value_coeff': 0.5, # Coefficient for value loss (common to scale down)
-    'entropy_coeff': -1e-4, # Coefficient for entropy bonus
-
-
-    'ckpt_save_interval_seconds': 600, # Save checkpoint every N seconds (e.g., 10 minutes)
-
-    # 麻将 RL 的特殊设置
-    'filter_single_action_steps': False, # 是否过滤掉只有单个可能 action 的时间步
-    'use_normalized_reward': True,
-
-    # 多样化 opponent
-    'p_opponent_historical' : 0.4,
-    "benchmark_policies": {
-        "initial_il_policy": "initial_models/actor_from_sl.pth",
+    # Benchmark 策略设置
+    'benchmark_policies': {
+        'initial_il_policy': "initial_models/actor_from_sl.pth",
     },
-    "initial_actor_eval_path": "initial_models/actor_from_sl.pth",
-    "initial_critic_eval_path": "initial_models/centralized_critic_initialized.pth",
-    "prob_opponent_is_benchmark": 0.15,
-
-    "server_hosted_benchmark_names": ["initial_il_policy"],
-
-    'opponent_sampling_k' : 115, 
-    'opponent_model_change_interval': 1, # 每多少个 episode 替换一次对手
-    'actor_model_change_interval': 1,
-
-
-    # Added for potential use in Learner/Actor logging/config
-    'log_interval_learner': 10, # Log Learner stats every N iterations
-    'log_interval_actor' : 10,
-    'model_push_interval': 10,   # Push model every N Learner iterations
-    'enable_profiling': False,
-    'enable_profiling_actor': False,
+    'server_hosted_benchmark_names': ["initial_il_policy"],
 
     # 关于 inference_server 的相关设置
-    'use_centralize_critic': True,
-    "inference_batch_size": 256,
-    "inference_max_wait_ms": 10, # 单位 ms
+    'inference_server_config': {
+        'inference_batch_size': 128,
+        'inference_max_wait_ms': 5, # 单位 ms
+        'max_history_actors': 10, # 历史 Actor 的最大数量
+        'history_actors_update_every': 100, # 每 100 次更新模型保存一次历史 Actor 模型
+    },
+
+    # 分布式训练配置
+    'num_actors': 8,
+
+    # 关于 Actor 的相关设置
+    'actor_config': {
+        'log_interval': 10, # Actor 日志间隔
+        'num_env_steps': 10000000, # Total number of environment steps to run across all actors
+        'num_envs_per_actor': 8, # 每个 Actor 运行的环境数量
+        # 对手的相关涉资
+
+        # 多样化 opponent
+        'p_opponent_historical' : 0.05,
+        'prob_opponent_is_benchmark': 0.4,
+        'opponent_model_change_interval': 10, # 每多少个 episode 替换一次对手
+
+        # 收集数据处理
+        'filter_single_action_steps': False, # [Deprecated] 是否过滤掉只有单个可能 action 的时间步
+        'use_normalized_reward': True,
+
+        'inference_timeout_seconds': 5, 
+    },
+
+    # 关于 Learner 的相关设置
+    'learner_config': {
+        'log_interval': 100, 
+        'model_push_interval': 10,
+        'ckpt_save_interval_seconds': 600, # 保存检查点的间隔时间
+        'min_sample_to_start_learner': 20000, # 开始训练需要的 buffer 样本数
+        'training_components_log_freq': 1000,  # 训练组件状态日志频率
+    },
+
+    # PPO 基本设置
+    'ppo_config': {
+        'gamma': 0.98,      # Discount factor for GAE/TD Target
+        'lambda': 0.97,     # Lambda for GAE
+        'clip': 0.2,        # PPO clip epsilon
+        'grad_clip_norm': 0.3,
+        'value_coeff': 0.5, # Coefficient for value loss (common to scale down)
+        'entropy_coeff': -1e-4, # Coefficient for entropy bonus 正常是正数，但这里是负数表示惩罚
+        'batch_size': 1024, # Increased batch size
+        'epochs_per_batch': 5, # Renamed 'epochs' for clarity (PPO inner loops)
+
+
+        # Learner Hyperparameters        'lr_actor': 3e-5,  # Actor overall learning rate
+        'lr_critic_feature_extractor': 3e-4,  # Critic feature_extractor_obs learning rate  
+        'lr_critic_head': 3e-4,  # Critic head (includes feature_extractor_extra + critic_head_mlp) learning rate
+        
+        # Learning rate scheduling
+        'use_lr_scheduler': True,  # Enable learning rate scheduling
+        "warmup_iterations": 1000,
+        'total_iterations_for_lr_decay': 500000,
+        'min_lr_for_scheduled_components': 1e-6,
+        'initial_lr_warmup_actor': 3e-6,
+        'initial_lr_warmup_critic_fe': 3e-6,
+        'initial_lr_warmup_critic_head': 3e-5,
+        # Staged training configuration
+        'stage1_iterations': 10000,  # Only train critic_head group (fe_extra + head_mlp)
+        'stage2_iterations': 50000,  # Unfreeze critic_fe_obs, keep actor frozen
+        # Stage 3 starts at stage2_iterations: joint training of all components
+    },
+
+    # 性能 profiling 相关设置
+    'profiling_config': {
+        'enable_profiling': False,
+        'enable_profiling_actor': False
+    }
 }
 
 
@@ -214,8 +233,8 @@ def main():
         handlers=[logging.StreamHandler()] # Root logs to console
     )
     
-    run_name = CONFIG['experiment_name']
-    log_base_dir = CONFIG['log_base_dir']
+    run_name = CONFIG['experiment_meta']['experiment_name']
+    log_base_dir = CONFIG['experiment_meta']['log_base_dir']
 
     try:
         g_main_logger, g_main_writer = setup_process_logging_and_tensorboard(
@@ -253,6 +272,7 @@ def main():
             actor_id_key = f'Actor-{CONFIG.get("actor_id_base", 0) + i}' # 与 Actor 配置中的 name 保持一致
             server_to_actors_resp_qs[actor_id_key] = mp.Queue()
         g_main_logger.info("Communication queues for InferenceServer created.")        # 2. 准备 InferenceServer 配置
+        
         benchmark_models_info_for_server = {}
         # 从 benchmark_policies 配置中获取基准模型信息
         for policy_name, policy_path in CONFIG.get('benchmark_policies', {}).items():
@@ -263,22 +283,15 @@ def main():
                 g_main_logger.warning(f"Benchmark model path not found: {policy_path} for policy '{policy_name}'")
         
         server_config = {
-            'name': 'InferenceServer-Main', # 服务器进程的名称
+            'name': 'InferenceServer', # 服务器进程的名称
             'server_id': f"inference_server_{os.getpid()}", # 给服务器一个唯一ID，用于日志
-            'log_base_dir': CONFIG['log_base_dir'],
-            'experiment_name': CONFIG['experiment_name'],
-            'in_channels': CONFIG['in_channels'],
-            'out_channels': CONFIG['out_channels'],
-            'critic_extra_in_channels': CONFIG.get('critic_extra_in_channels', 16),
-            'device': CONFIG['device'], # InferenceServer 将模型加载到哪个设备
-            'initial_actor_eval_path': CONFIG.get('initial_actor_eval_path'), # 初始 Actor 模型的路径
-            'initial_critic_eval_path': CONFIG.get('initial_critic_eval_path'), # 初始 Critic 模型的路径
+
             'benchmark_models_info': benchmark_models_info_for_server, # 要托管的基准模型
-            'actor_class': ResNet34Actor,
-            'critic_class': ResNet34CentralizedCritic,
-            'inference_batch_size': CONFIG.get('inference_batch_size', 32),
-            'inference_max_wait_ms': CONFIG.get('inference_max_wait_ms', 10)
         }
+        server_config.update(CONFIG['experiment_meta']) # 添加实验元数据
+        server_config.update(CONFIG['model_agent_config']) # 添加模型和代理配置
+        server_config.update(CONFIG['inference_server_config']) # 添加 InferenceServer 特定配置
+
         g_main_logger.info("InferenceServer configuration prepared.")
 
         # 3. 实例化并启动 InferenceServer
@@ -308,20 +321,17 @@ def main():
         g_main_logger.info("Replay Buffer initialized.")
 
         # 5. 准备并启动 Learner
-        checkpoint_dir = os.path.join(CONFIG['checkpoint_base_dir'], run_name)
+        checkpoint_dir = os.path.join(CONFIG['experiment_meta']['checkpoint_base_dir'], run_name)
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        learner_config = CONFIG.copy() # 为 Learner 创建配置副本
-        learner_config['name'] = 'Learner-Main' # 给 Learner 一个明确的名称
+        learner_config = CONFIG['learner_config'].copy() # 为 Learner 创建配置副本
+        learner_config.update(CONFIG['experiment_meta']) # 添加实验元数据
+        learner_config.update(CONFIG['model_agent_config']) # 添加模型和代理配置
+        learner_config.update(CONFIG['ppo_config']) # 添加 PPO 配置
+
         learner_config['ckpt_save_path'] = checkpoint_dir # 传递检查点保存路径
         learner_config['shutdown_event'] = shutdown_event # 传递关闭事件
         learner_config['inference_server_cmd_queue'] = g_learner_to_server_cmd_q # 传递命令队列
-        # learner_config['critic_extra_in_channels'] = CONFIG.get('critic_extra_in_channels', 16) # 传递 Critic 的额外输入通道数
-        # Learner 不再需要旧的 ModelPool 配置 (如果完全依赖 InferenceServer)
-        # learner_config.pop('model_pool_name', None) 
-        # learner_config.pop('model_pool_size', None)
-        # Learner 需要知道模型同步间隔
-        learner_config['model_sync_interval'] = CONFIG.get('model_sync_interval_learner', 10)
 
 
         g_main_logger.info("Initializing Learner...")
@@ -341,8 +351,16 @@ def main():
         g_main_logger.info(f"Initializing {CONFIG['num_actors']} Actors...")
         g_actor_processes.clear() # 清空全局列表以防重用
         for i in range(CONFIG['num_actors']):
-            actor_config = CONFIG.copy() # 为每个 Actor 创建配置副本
-            actor_id_val = CONFIG.get('actor_id_base', 0) + i # 计算唯一的 Actor ID
+
+            actor_config = CONFIG['actor_config'].copy() # 获取 Actor 特定配置
+            actor_config.update(CONFIG['experiment_meta']) # 添加实验元数据
+            actor_config.update(CONFIG['model_agent_config']) # 添加模型和代理配置
+            actor_config.update(CONFIG['ppo_config']) # 添加 PPO 配置
+            actor_config.update(CONFIG['profiling_config']) # 添加 profiling 配置
+
+            actor_config['server_hosted_benchmark_names'] = CONFIG['server_hosted_benchmark_names'] # 添加服务器托管的基准模型名称
+
+            actor_id_val = i # 计算唯一的 Actor ID
             actor_name_key = f'Actor-{actor_id_val}' # 创建 Actor 名称
             
             actor_config['name'] = actor_name_key
@@ -350,11 +368,6 @@ def main():
             actor_config['shutdown_event'] = shutdown_event # 传递关闭事件
             actor_config['inference_server_req_queue'] = actors_to_server_req_q # 推理请求队列
             actor_config['inference_server_resp_queue'] = server_to_actors_resp_qs[actor_name_key] # 专属的响应队列
-            # Actors 也不再需要旧的 ModelPool 配置 (如果完全依赖 InferenceServer)
-            actor_config.pop('model_pool_name', None)
-            actor_config['env_config'] = {
-                'agent_clz': CONFIG['agent_clz'], # 指定环境内部使用的 Agent 类
-            }
 
             actor = Actor(actor_config, replay_buffer)
             g_actor_processes.append(actor)

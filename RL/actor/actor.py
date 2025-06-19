@@ -75,7 +75,7 @@ class Actor(Process):
 
         
         # Actor 需要知道可以在服务器上请求哪些基准模型的键名
-        self.server_hosted_benchmark_names = self.config.get("server_hosted_benchmark_names", [])
+        self.server_hosted_benchmark_names = self.config.get('server_hosted_benchmark_names', [])
         if not self.server_hosted_benchmark_names:
             # logger 可能还未初始化
             print(f"[{self.name}] Info: No server-hosted benchmark model names provided in config.")
@@ -128,7 +128,7 @@ class Actor(Process):
         
         # 3. 计算 GAE 和 TD-Target
         gamma = self.config.get('gamma', 0.99)
-        lambda_gae = self.config.get('lambda_gae', 0.95) # 确保配置中使用 lambda_gae
+        lambda_gae = self.config.get('lambda', 0.95) # 确保配置中使用 lambda
         
         advantages = np.zeros_like(rewards_np)
         last_gae_lam = 0.0
@@ -166,8 +166,6 @@ class Actor(Process):
         
         try:
             self.replay_buffer.push(data_to_push)
-            # 可以在这里记录推送成功，但为了避免日志过于频繁，可以设为 DEBUG 级别
-            # self.logger.debug(f"Successfully pushed {len(data_to_push['action'])} timesteps to replay buffer.")
         except Exception as e:
             self.logger.error(f"Error pushing data to replay buffer: {e}", exc_info=True)
 
@@ -240,7 +238,10 @@ class Actor(Process):
                 agent_buffer['reward'].append(reward)
                 
                 # 累积原始奖励用于episode结束时的统计
+            
+            for agent_name, reward in rewards_dict_env.items():
                 episode_raw_rewards[i][agent_name] += reward
+                # self.logger.info(f"Agent: {agent_name}, Action: {action_taken}, Reward: {reward:.2f}")
 
     def _handle_done_envs(self, episode_buffers: list, dones: np.ndarray, env_policy_keys: dict, 
                           episode_start_times: list, episode_step_counts: list, episode_raw_rewards: list,
@@ -266,23 +267,30 @@ class Actor(Process):
                 episode_step_count = episode_step_counts[i]
                 episode_raw_reward_dict = episode_raw_rewards[i]
                 episode_num = episode_nums[i]
-                
-                # 获取主要agent的奖励用于日志记录
+                # 获取 agent 的奖励用于日志记录
                 agent_names = self.config.get('agent_names', DEFAULT_AGENT_NAMES_LIST)
-                main_agent_seat_idx = self.config.get('actor_main_seat_idx', 0)
-                main_agent_name = agent_names[main_agent_seat_idx] if main_agent_seat_idx < len(agent_names) else agent_names[0]
-                main_agent_reward = episode_raw_reward_dict.get(main_agent_name, 0.0)
-                
-                self.logger.info(f"Environment {i} in Actor {self.name} finished episode {episode_num+1} "
-                               f"in {episode_step_count} steps ({episode_duration:.2f}s). "
-                               f"Main Agent ({main_agent_name}) Raw Reward: {main_agent_reward:.2f}")
+
+                sum_raw_rewards_for_latest_policy = 0
+                for agent_name, agent_data in episode_buffers[i].items():
+                    if env_policy_keys[i].get(agent_name) == 'latest_eval':
+                        sum_raw_rewards_for_latest_policy += episode_raw_reward_dict.get(agent_name)
+
+                reward_string = ', '.join([(str(episode_raw_reward_dict.get(agent_name))) for agent_name, agent_data in episode_buffers[i].items()])
+                policy_string = ', '.join([f"{agent_name}: {env_policy_keys[i].get(agent_name, 'unknown')}" for agent_name in agent_names])
+
+                if (episode_num + 1) % self.config.get('log_interval', 10) == 0:
+                    self.logger.info(f"Environment {i} in Actor {self.name} finished episode {episode_num+1} "
+                                f"in {episode_step_count} steps ({episode_duration:.2f}s). "
+                                f"Total Raw Reward for Latest Agent: {sum_raw_rewards_for_latest_policy:.2f}. "
+                                f"Reward String ({reward_string}), Policies: {policy_string}"
+                                )
                 
                 # 1. 获取这个完成的 episode 的数据
                 completed_episode_data = episode_buffers[i]
                 
                 # 2. 应用奖励变换逻辑（如果配置了）
                 if self.config.get('use_normalized_reward', False) and len(agent_names) == 4:
-                    self.logger.info(f"Episode {episode_num+1} Env {i}: Applying reward normalization/transformation.")
+                    self.logger.debug(f"Episode {episode_num+1} Env {i}: Applying reward normalization/transformation.")
                     
                     # 获取原始分数
                     raw_scores_ordered = [episode_raw_reward_dict.get(name, 0.0) for name in agent_names]
@@ -317,7 +325,6 @@ class Actor(Process):
                 # 3. TensorBoard记录
                 if self.writer:
                     try:
-                        self.writer.add_scalar(f'Actor_{self.name}/Reward/MainAgentRawEp', main_agent_reward, total_actor_steps)
                         self.writer.add_scalar(f'Actor_{self.name}/Episode/Length', episode_step_count, total_actor_steps)
                         self.writer.add_scalar(f'Actor_{self.name}/Episode/Duration', episode_duration, total_actor_steps)
                         
@@ -334,7 +341,7 @@ class Actor(Process):
                 # 4. 准备数据 (计算 GAE) 并推送到 Replay Buffer
                 for agent_name, agent_data in completed_episode_data.items():
                     # 只有使用了 "latest_eval" 策略的 agent 的数据才会被用于训练
-                    agent_policy = env_policy_keys[i].get(agent_name, "latest_eval")
+                    agent_policy = env_policy_keys[i].get(agent_name, 'latest_eval')
                     if agent_policy != 'latest_eval':
                         self.logger.debug(f"Skipping data push for env {i} agent {agent_name} "
                                         f"(policy: {agent_policy}, not latest_eval)")
@@ -352,6 +359,8 @@ class Actor(Process):
                 episode_step_counts[i] = 0
                 episode_raw_rewards[i] = {name: 0.0 for name in agent_names}
                 episode_nums[i] += 1
+
+                self._prepare_opponents(episode_num, env_policy_keys, i) # 更新对手策略
 
 
     def _response_worker_loop(self):
@@ -414,13 +423,13 @@ class Actor(Process):
 
         try:
             if self.logger: self.logger.debug(f"{log_msg_prefix}: 正在发送推理请求...")
-            self.inference_req_queue.put(payload, timeout=self.config.get("queue_put_timeout_seconds", 2.0))
+            self.inference_req_queue.put(payload, timeout=self.config.get('queue_put_timeout_seconds', 2.0))
             
             if self.logger: self.logger.debug(f"{log_msg_prefix}: 请求已发送。正在等待内部工作线程的响应...")
             
             # 从内部的 ThreadQueue 获取响应，这个响应是由 _response_worker_loop 放入的
             # 需要设置一个合理的超时时间
-            timeout_duration = self.config.get("inference_timeout_seconds", 5.0)
+            timeout_duration = self.config.get('inference_timeout_seconds', 5.0)
             
             # 循环获取，直到拿到与 current_internal_request_id 匹配的响应，或者超时
             # 这是为了处理一种可能性：如果之前的 get 超时了，但响应稍后到达并被worker线程放入队列，
@@ -481,34 +490,31 @@ class Actor(Process):
             else: print(err_msg)
             return 0, 0.0, 0.0
 
-    def _prepare_opponents(step: int, env_policy_keys: dict, num_envs_per_actor: int):
+    def _prepare_opponents(self, episode_num: int, env_policy_keys: dict, env_to_update: int):
 
-        for i in range(num_envs_per_actor):
-            for seat_idx in range(4):
-                agent_name_for_seat = DEFAULT_AGENT_NAMES_LIST[seat_idx]
-                env_policy_keys[i][agent_name_for_seat] = "latest_eval" # 默认使用最新评估模型
+        if (episode_num + 1) % self.config.get('opponent_model_change_interval', 10) == 0:
 
-            # prob_opponent_is_benchmark: 从服务器请求基准模型的概率
-        # prob_opponent_is_benchmark_server = self.config.get('prob_opponent_is_benchmark', 0.15)
-        # # prob_opponent_is_historical_via_server: 从服务器请求历史模型的概率 (当前简化为也请求 'latest_eval' 或其他 benchmark)
-        # # p_opponent_historical_via_server = self.config.get('p_opponent_historical_via_server', 0.2) 
+            env_policy_keys[env_to_update] = {}
 
-        # opponent_model_change_interval = self.config.get('opponent_model_change_interval', 1)
-        # # 注意：这里的逻辑现在是基于总步数，而不是 episode 数
-        # if step % opponent_model_change_interval_steps == 0:
-        #     self.logger.info(f"Actor {self.name}, Step {step}: Re-evaluating policies for all parallel environments.")
-        #     for i in range(num_envs_per_actor):
-        #         # (这里是您之前的策略选择逻辑，但现在是为每个并行环境 i 进行)
-        #         main_agent_seat_idx = np.random.randint(0, 4)
-        #         for seat_idx in range(4):
-        #             agent_name_for_seat = DEFAULT_AGENT_NAMES_LIST[seat_idx] # 使用一个固定的名字列表
-        #             if seat_idx == main_agent_seat_idx:
-        #                 env_policy_keys[i][agent_name_for_seat] = "latest_eval"
-        #             else:
-        #                 if self.server_hosted_benchmark_names and np.random.rand() < prob_opponent_is_benchmark_server:
-        #                     env_policy_keys[i][agent_name_for_seat] = random.choice(self.server_hosted_benchmark_names)
-        #                 else:
-        #                     env_policy_keys[i][agent_name_for_seat] = "latest_eval"
+            current_agent_seat_idx = np.random.randint(0, 4) # 随机选择一个座位作为主智能体
+
+            p = np.random.random((4,))
+            p_historical = self.config.get('p_opponent_historical', 0.15) # 从配置中获取概率
+            p_benchmark = self.config.get('p_opponent_benchmark', 0.4) # 从配置中获取概率
+
+            for seat_ix in range(4):
+                agent_name_for_seat = DEFAULT_AGENT_NAMES_LIST[seat_ix]
+                if seat_ix == current_agent_seat_idx:
+                    # 主智能体使用最新评估模型
+                    env_policy_keys[env_to_update][agent_name_for_seat] = "latest_eval"
+                else:
+                    # 其他座位的智能体根据概率选择模型
+                    if self.server_hosted_benchmark_names and p[seat_ix] < p_benchmark:
+                        env_policy_keys[env_to_update][agent_name_for_seat] = random.choice(self.server_hosted_benchmark_names)
+                    elif p[seat_ix] < p_historical + p_benchmark:
+                        env_policy_keys[env_to_update][agent_name_for_seat] = "random_historical" # 使用历史模型
+                    else:
+                        env_policy_keys[env_to_update][agent_name_for_seat] = "latest_eval"
 
 
     # 进程启动时执行的主函数
@@ -558,14 +564,13 @@ class Actor(Process):
                 from agent.feature_timeseries import FeatureAgentTimeSeries
                 from agent.feature import FeatureAgent
 
-                env_config = config.get('env_config', {})
                 # (如果需要，在这里解析字符串为类对象)
-                if isinstance(env_config.get('agent_clz'), str):
-                    if env_config['agent_clz'] == 'FeatureAgentTimeSeries':
-                        env_config['agent_clz'] = FeatureAgentTimeSeries
-                    elif env_config['agent_clz'] == 'FeatureAgent':
-                        env_config['agent_clz'] = FeatureAgent
-                return MahjongGBEnv(config=env_config)
+                if isinstance(config.get('agent_clz'), str):
+                    if config['agent_clz'] == 'FeatureAgentTimeSeries':
+                        config['agent_clz'] = FeatureAgentTimeSeries
+                    elif config['agent_clz'] == 'FeatureAgent':
+                        config['agent_clz'] = FeatureAgent
+                return MahjongGBEnv(config=config)
             return _init
 
         # 2. 从配置中读取并行环境的数量
@@ -605,11 +610,14 @@ class Actor(Process):
         # 结构: {env_idx: {'player_0': 'model_key', 'player_1': 'model_key', ...}}
         env_policy_keys = [{} for _ in range(num_envs_per_actor)]
         
-        # 初始化每个环境的策略分配
+
         for i in range(num_envs_per_actor):
-            for seat_idx in range(4):
-                agent_name_for_seat = agent_names[seat_idx] if seat_idx < len(agent_names) else f"player_{seat_idx+1}"
-                env_policy_keys[i][agent_name_for_seat] = "latest_eval"  # 默认使用最新评估模型
+            self._prepare_opponents(-1, env_policy_keys, i)
+        # 初始化每个环境的策略分配
+        # for i in range(num_envs_per_actor):
+        #     for seat_idx in range(4):
+        #         agent_name_for_seat = agent_names[seat_idx] if seat_idx < len(agent_names) else f"player_{seat_idx+1}"
+        #         env_policy_keys[i][agent_name_for_seat] = "latest_eval"  # 默认使用最新评估模型
 
         for step in range(total_steps_to_run):
             # if self.shutdown_event and self.shutdown_event.is_set():
@@ -744,25 +752,8 @@ class Actor(Process):
             
         Returns:
             np.ndarray: 中心化状态信息，格式为适合ExtraInfoFeatureExtractor的4D张量
-        """
-        agent_names = self.config.get('agent_names', DEFAULT_AGENT_NAMES_LIST)
-        
-        # 如果提供了 global_obs，直接使用它作为主要信息源
-        if global_obs is not None:
-            # global_obs 的形状应该是 (16, 4, 9)
-            # 我们将其保持为 3D 张量，并添加batch维度用于 Conv2d
-            centralized_base = global_obs.copy()  # (16, 4, 9)
-
-        # # 将额外信息编码到最后一个通道
-        # # 当前agent的索引
-        # current_agent_idx = agent_names.index(current_agent_name) if current_agent_name in agent_names else 0
-        # # 环境索引（归一化）
-        # env_idx_normalized = min(env_idx / 10.0, 1.0)  # 假设最多10个环境
-        
-        # # 在最后的一些位置添加额外信息
-        # centralized_base[-1, -1, -1] = current_agent_idx / len(agent_names)  # 归一化的agent索引
-        # centralized_base[-1, -1, -2] = env_idx_normalized  # 归一化的环境索引
-        
+        """        
+        centralized_base = global_obs.copy()  # (16, 4, 9)
         return centralized_base.astype(np.float32)
 
     def _get_batch_actions_from_inference_server(self, flat_inference_requests: list):
@@ -790,7 +781,7 @@ class Actor(Process):
             payload = (self.name, current_request_id, req['model_key'], req['obs_data'])
             
             try:
-                self.inference_req_queue.put(payload, timeout=self.config.get("queue_put_timeout_seconds", 2.0))
+                self.inference_req_queue.put(payload, timeout=self.config.get('queue_put_timeout_seconds', 2.0))
             except QueueFull:
                 self.logger.error(f"Failed to send request {current_request_id} to InferenceServer: queue full")
                 # 对于发送失败的请求，返回默认值
@@ -798,7 +789,7 @@ class Actor(Process):
         
         # 等待所有响应
         results = []
-        timeout_duration = self.config.get("inference_timeout_seconds", 10.0)  # 批处理可能需要更长时间
+        timeout_duration = self.config.get('inference_timeout_seconds', 10.0)  # 批处理可能需要更长时间
         start_time = time.time()
         
         received_responses = {}  # request_id -> (action, value, log_prob)

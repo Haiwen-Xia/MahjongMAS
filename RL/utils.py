@@ -31,12 +31,16 @@ def calculate_scheduled_lr(current_iter, base_lr, warmup_iters, total_iters_for_
         # 线性预热阶段
         # 学习率从 initial_lr_for_warmup 线性增加到 base_lr
         # 当 current_iter = 0, lr = initial_lr_for_warmup
-        # 当 current_iter = warmup_iters, lr = base_lr
-        # progress = current_iter / float(warmup_iters) # 这样在 warmup_iters-1 时不到 base_lr
-        # 为了在第 warmup_iters 步达到 base_lr (即预热完成后的第一个decay step使用base_lr)，
-        # 或者说在 warmup_iters-1 步接近 base_lr，这里采用 current_iter / warmup_iters 的比例
-        lr = initial_lr_for_warmup + (base_lr - initial_lr_for_warmup) * (current_iter / float(warmup_iters))
-        return lr
+        # 当 current_iter = warmup_iters-1, lr = base_lr
+        # 修复：确保在第 warmup_iters-1 步达到 base_lr
+        if warmup_iters == 1:
+            # 特殊情况：只有1步warmup，直接返回base_lr
+            return base_lr
+        else:
+            # 正常情况：线性插值，在第 warmup_iters-1 步达到 base_lr
+            progress = current_iter / float(warmup_iters - 1)
+            lr = initial_lr_for_warmup + (base_lr - initial_lr_for_warmup) * progress
+            return lr
     else:
         # 余弦退火阶段 (或在预热之后，衰减完成之后保持min_lr)
         # 已经完成预热，或者没有预热阶段 (warmup_iters == 0)

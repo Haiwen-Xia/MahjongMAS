@@ -6,7 +6,7 @@ import numpy as np
 from utils import calculate_scheduled_lr
 
 class PPOAlgorithm:
-    def __init__(self, config, actor: nn.Module, critic: nn.Module):
+    def __init__(self, config, actor: nn.Module, critic: nn.Module, logger: logging.Logger = None):
         """
         初始化PPO算法模块。
 
@@ -16,23 +16,8 @@ class PPOAlgorithm:
         """
         self.config = config
         self.device = torch.device(config.get('device', 'cpu'))
-        self.logger = logging.getLogger(f"PPOAlgorithm") # 假设日志系统已配置
-        
-        # 健壮性配置参数
-        self.config.setdefault('verbose_batch_info', False)  # 是否打印详细的batch信息
-        self.config.setdefault('use_obs_as_fallback', True)  # 当缺少global_obs时是否使用obs作为备选
-        
-        # 训练阶段解冻配置参数
-        self.config.setdefault('stage1_iterations', 10000)  # 只训练critic头部的迭代数
-        self.config.setdefault('stage2_iterations', 50000)  # 开始训练critic特征提取器的迭代数
-        
-        # 学习率调度配置参数
-        self.config.setdefault('use_lr_scheduler', False)  # 是否使用学习率调度
-        self.config.setdefault('warmup_iterations', 1000)   # 学习率预热迭代数
-        self.config.setdefault('total_iterations_for_lr_decay', 500000)  # 学习率衰减总迭代数
-        self.config.setdefault('min_lr_for_scheduled_components', 1e-6)  # 最小学习率
-        
-        # 解冻时学习率重置配置
+        self.logger = logger
+
         self.config.setdefault('reset_lr_on_unfreeze', True)  # 组件解冻时是否重置学习率计数
         
         self.actor = actor.to(self.device)  # 假设 actor 是一个 nn.Module
@@ -193,8 +178,8 @@ class PPOAlgorithm:
         new_lr_critic_head = calculate_scheduled_lr(critic_head_effective_iter, lr_critic_head, warmup_iters, total_iters, min_lr, initial_lr_warmup_critic_head)
         
         # 记录调整后的学习率（仅在值变化时）
-        if iterations % 1000 == 0 or iterations < 100:
-            self.logger.debug(f"学习率 - Actor: {new_lr_actor:.6f} (有效迭代: {actor_effective_iter}), "
+        if iterations % 1000 == 0:
+            self.logger.info(f"学习率 - Actor: {new_lr_actor:.6f} (有效迭代: {actor_effective_iter}), "
                             f"Critic FE: {new_lr_critic_fe:.6f} (有效迭代: {critic_fe_effective_iter}), "
                             f"Critic头部: {new_lr_critic_head:.6f}")
         
@@ -214,109 +199,17 @@ class PPOAlgorithm:
         """
         使用一个批次的数据执行一次完整的 PPO 更新（包括多个内部 epoch）。
         """
+        
         # --- 1. 数据准备 ---
-        try:
-            # 打印批次中的主要键和形状，帮助调试
-            if self.config.get('verbose_batch_info', False):
-                self.logger.debug(f"Batch keys: {list(batch.keys())}")
-                self.logger.debug(f"State keys: {list(batch['state'].keys()) if 'state' in batch else 'No state'}")
-                for key in batch.keys():
-                    if isinstance(batch[key], dict):
-                        self.logger.debug(f"{key} is dict with keys: {list(batch[key].keys())}")
-                    elif isinstance(batch[key], (list, np.ndarray)):
-                        self.logger.debug(f"{key} shape: {np.array(batch[key]).shape}")
-                    else:
-                        self.logger.debug(f"{key} type: {type(batch[key])}")
-            
-            # 检查必要的键
-            required_keys = ['state', 'action', 'adv', 'target', 'log_prob']
-            for key in required_keys:
-                if key not in batch:
-                    self.logger.error(f"Missing required key '{key}' in batch")
-                    return {}
-            
-            # 检查state中必要的键
-            required_state_keys = ['observation', 'action_mask']
-            for key in required_state_keys:
-                if key not in batch['state']:
-                    self.logger.error(f"Missing required key '{key}' in batch['state']")
-                    return {}
-            
-            # 将批次数据转换为张量并移动到设备
-            try:
-                obs = torch.tensor(batch['state']['observation']).to(self.device, non_blocking=True)
-                self.logger.debug(f"Obs shape: {obs.shape}")
-            except Exception as e:
-                self.logger.error(f"Error converting observation to tensor: {e}")
-                self.logger.error(f"Observation type: {type(batch['state']['observation'])}")
-                if isinstance(batch['state']['observation'], (list, np.ndarray)):
-                    self.logger.error(f"Observation shape: {np.array(batch['state']['observation']).shape}")
-                return {}
-            
-            try:
-                mask = torch.tensor(batch['state']['action_mask']).to(self.device, non_blocking=True)
-                self.logger.debug(f"Mask shape: {mask.shape}")
-            except Exception as e:
-                self.logger.error(f"Error converting action_mask to tensor: {e}")
-                return {}
-            
-            states = {'obs': {'observation': obs, 'action_mask': mask}}
-            
-            try:
-                actions = torch.tensor(batch['action'], dtype=torch.long).unsqueeze(-1).to(self.device, non_blocking=True)
-                self.logger.debug(f"Actions shape: {actions.shape}")
-            except Exception as e:
-                self.logger.error(f"Error converting actions to tensor: {e}")
-                return {}
-            
-            try:
-                advs = torch.tensor(batch['adv']).to(self.device, non_blocking=True)
-                self.logger.debug(f"Advantages shape: {advs.shape}")
-            except Exception as e:
-                self.logger.error(f"Error converting advantages to tensor: {e}")
-                return {}
-            
-            try:
-                targets = torch.tensor(batch['target']).to(self.device, non_blocking=True)
-                self.logger.debug(f"Targets shape: {targets.shape}")
-            except Exception as e:
-                self.logger.error(f"Error converting targets to tensor: {e}")
-                return {}
-            
-            try:
-                old_log_probs_from_buffer = torch.tensor(batch['log_prob']).to(self.device, non_blocking=True)
-                self.logger.debug(f"Log probs shape: {old_log_probs_from_buffer.shape}")
-            except Exception as e:
-                self.logger.error(f"Error converting log_prob to tensor: {e}")
-                return {}
-            
-            # 提取global_obs用于critic (增强版检查)
-            global_obs = None
-            
-            # 策略1：首先尝试使用'global_obs'
-            if 'global_obs' in batch['state'] and batch['state']['global_obs'] is not None:
-                try:
-                    global_obs_data = batch['state']['global_obs']
-                    if isinstance(global_obs_data, (list, np.ndarray)) and len(global_obs_data) > 0:
-                        global_obs = torch.tensor(global_obs_data).to(self.device, non_blocking=True)
-                        self.logger.debug(f"Using 'global_obs' for critic training. Shape: {global_obs.shape}")
-                    else:
-                        self.logger.warning(f"'global_obs' exists but has invalid structure: {type(global_obs_data)}")
-                except Exception as e:
-                    self.logger.warning(f"Error converting 'global_obs' to tensor: {e}")
-            
-        except Exception as e:
-            self.logger.error(f"Error preparing batch for training: {e}", exc_info=True)
-            self.logger.error(f"Batch keys: {list(batch.keys()) if batch else 'None'}")
-            if batch and 'state' in batch:
-                state_keys = list(batch['state'].keys())
-                self.logger.error(f"State keys: {state_keys}")
-                
-            # 打印更多关于CUDA错误的可能信息
-            if "CUDA" in str(e):
-                self.logger.error("CUDA错误可能与形状不匹配或数据类型不兼容有关。请检查设备和张量形状。")
-                
-            return {}
+        obs = torch.tensor(batch['state']['observation']).to(self.device, non_blocking=True)
+        mask = torch.tensor(batch['state']['action_mask']).to(self.device, non_blocking=True)
+        states = {'obs': {'observation': obs, 'action_mask': mask}}
+        actions = torch.tensor(batch['action'], dtype=torch.long).unsqueeze(-1).to(self.device, non_blocking=True)   
+        advs = torch.tensor(batch['adv']).to(self.device, non_blocking=True)
+        targets = torch.tensor(batch['target']).to(self.device, non_blocking=True)
+        old_log_probs_from_buffer = torch.tensor(batch['log_prob']).to(self.device, non_blocking=True)
+        global_obs_data = batch['state']['global_obs']
+        global_obs = torch.tensor(global_obs_data).to(self.device, non_blocking=True)
 
         self.actor.train()
         self.critic.train()

@@ -152,9 +152,6 @@ class Learner(Process):
         config_to_log = {}
         known_unserializable_keys = ['shutdown_event', 'inference_server_cmd_queue'] # 以及其他可能的队列或事件对象
         
-        # 设置新增配置参数的默认值
-        self.config.setdefault('training_components_log_freq', 1000)  # 训练组件状态日志频率
-        
         for key, value in self.config.items():
             if key in known_unserializable_keys:
                 config_to_log[key] = f"<{type(value).__name__} object at {hex(id(value))}>" # 或者 str(value)
@@ -196,13 +193,13 @@ class Learner(Process):
             # a. 创建模型实例 (Actor 和 Critic)
             #    这里假设您有一个主模型类，它内部包含了 actor 和 critic
             #    如果它们是完全分离的，则分别创建
-            self.actor = ResNet34Actor(
+            self.actor = self.config['actor_class'](
                 in_channels=self.config['in_channels'],
                 out_channels=self.config['out_channels'],
             ).to(device)
-            self.critic = ResNet34CentralizedCritic(
+            self.critic = self.config['critic_class'](
                 in_channels_obs=self.config['in_channels'],
-                in_channels_extra=self.config.get('critic_extra_in_channels', 0), # 可能需要根据配置调整
+                in_channels_extra=self.config.get('critic_extra_in_channels', 0),
             ).to(device)
 
             self.logger.info("RL model instance created.")
@@ -222,19 +219,16 @@ class Learner(Process):
             self.logger.info("SL weights loaded and Critic FE initialized.")
 
             # c. 创建算法实例，它会接管模型、优化器和更新逻辑
-            self.algorithm = PPOAlgorithm(self.config, self.actor, self.critic)
+            self.algorithm = PPOAlgorithm(self.config, self.actor, self.critic, self.logger)
             self.logger.info("PPOAlgorithm instance created.")
 
             # --- 6. 等待 Replay Buffer 数据 ---
             min_samples = self.config.get('min_sample_to_start_learner', 20000)
-            # 降低默认等待阈值，以避免长时间阻塞
-            min_samples = min(min_samples, self.config.get('min_samples_fallback', 50000))
             
             self.logger.info(f"Waiting for Replay Buffer to have at least {min_samples} samples...")
+
             last_logged_size = -1
-            wait_start_time = time.time()
-            max_wait_time = self.config.get('max_wait_replay_buffer_sec', 300)  # 最大等待5分钟
-            self.logger.info("开始等待ReplayBuffer数据...")
+
             should_exit = False
             
             # 等待ReplayBuffer循环
@@ -262,30 +256,11 @@ class Learner(Process):
                         self.logger.info(f"已达到所需样本数: {current_buffer_size}/{min_samples}")
                         break
                     
-                    # 检查是否超时
-                    elapsed_wait = time.time() - wait_start_time
-                    if elapsed_wait > max_wait_time:
-                        self.logger.warning(f"等待ReplayBuffer超时: {elapsed_wait:.1f}秒已过，当前大小: {current_buffer_size}/{min_samples}。无论如何开始训练。")
-                        break
-                        
                     # 定期日志记录
-                    if current_buffer_size > last_logged_size and \
-                       (current_buffer_size % (min_samples // 10 + 1) == 0 or \
-                        current_buffer_size - last_logged_size > self.config.get('rb_wait_log_interval_samples', 1000) or \
-                        current_buffer_size == 0):
-                        # 安全地获取队列大小
-                        q_size = 'N/A'
-                        if hasattr(self.replay_buffer, 'queue') and hasattr(self.replay_buffer.queue, 'qsize'):
-                            try:
-                                q_size = self.replay_buffer.queue.qsize()
-                            except Exception:
-                                q_size = 'N/A'
+                    else:
+                        self.logger.info(f"Replay Buffer size: {current_buffer_size}/{min_samples}. Waiting for more samples...")
+                        time.sleep(5)
                         
-                        self.logger.info(f"Replay buffer size: {current_buffer_size}/{min_samples}. Input queue(episodes): {q_size}. Elapsed: {elapsed_wait:.1f}s")
-                        last_logged_size = current_buffer_size
-                    
-                    # 短暂等待再检查
-                    time.sleep(self.config.get('rb_wait_check_interval_sec', 1.0))
                     
                 except Exception as e_rb_wait:  # 捕获缓冲区检查过程中的错误
                     self.logger.error(f"Error checking replay buffer size while waiting: {e_rb_wait}", exc_info=True)
@@ -306,18 +281,6 @@ class Learner(Process):
             cur_time_log = time.time() 
             iterations = 0 
             steps_processed_since_log = 0 
-
-            # 获取参数解冻和学习率调度的配置
-            # unfreeze_actor_head_after_iters = self.config.get('unfreeze_actor_head_after_iters', 0)
-            # unfreeze_actor_fe_after_iters = self.config.get('unfreeze_actor_feature_extractor_after_iters', 0)
-            use_lr_scheduler = self.config.get('use_lr_scheduler', False)
-
-            if use_lr_scheduler:
-                base_lr_for_scheduler = self.config.get('lr_critic_head', 3e-4)
-                warmup_iterations = self.config.get('warmup_iterations', 1000)
-                total_iterations_for_lr_decay = self.config.get('total_iterations_for_lr_decay', 500000)
-                # min_lr_scheduler_critic = self.config.get('min_lr_for_scheduled_components', 1e-6)
-                # initial_lr_for_warmup_critic = self.config.get('initial_lr_warmup_scheduled', base_lr_for_scheduler * 0.01)
                 
             # 主循环开始前安全检查shutdown_event以避免崩溃
             shutdown_detected = False
@@ -330,10 +293,7 @@ class Learner(Process):
             while not shutdown_detected:  # 使用安全标志而不是直接访问shutdown_event
                 start_iter_time = time.time()
 
-                # # 每隔一定迭代数输出心跳信息
-                # heartbeat_interval = self.config.get('heartbeat_interval', 1000)
-                # if iterations > 0 and iterations % heartbeat_interval == 0:
-                #     self.logger.info(f"[HEARTBEAT] Learner {self.name} is alive. Iteration: {iterations}, PID: {os.getpid()}")            # --- 7.0 更新模型参数状态 (解冻) 和学习率 ---
+                # --- 7.0 更新模型参数状态 (解冻) 和学习率 ---
                 # a. 更新模型的可训练状态 (解冻)
                 # 首先调用更新冻结状态，然后根据冻结状态调整学习率
                 self.algorithm.update_freezing_status(iterations)
@@ -342,36 +302,36 @@ class Learner(Process):
                 # 注意：schedule_learning_rate已经优化，考虑了组件解冻时间
                 self.algorithm.schedule_learning_rate(iterations)
                 
-                # c. 定期记录各组件的训练状态和学习率（便于调试）
-                log_freq = self.config.get('training_components_log_freq', 1000)
-                if iterations % log_freq == 0 or iterations < 10:
-                    # 检查和记录各组件的可训练状态
-                    actor_trainable = any(p.requires_grad for p in self.actor.parameters())
-                    critic_fe_trainable = False
-                    critic_head_trainable = False
+                # # c. 定期记录各组件的训练状态和学习率（便于调试）
+                # log_freq = self.config.get('training_components_log_freq', 1000)
+                # if iterations % log_freq == 0 or iterations < 10:
+                #     # 检查和记录各组件的可训练状态
+                #     actor_trainable = any(p.requires_grad for p in self.actor.parameters())
+                #     critic_fe_trainable = False
+                #     critic_head_trainable = False
                     
-                    if hasattr(self.critic, 'feature_extractor_obs'):
-                        critic_fe_trainable = any(p.requires_grad for p in self.critic.feature_extractor_obs.parameters())
+                #     if hasattr(self.critic, 'feature_extractor_obs'):
+                #         critic_fe_trainable = any(p.requires_grad for p in self.critic.feature_extractor_obs.parameters())
                     
-                    head_components = []
-                    if hasattr(self.critic, 'feature_extractor_extra'):
-                        head_components.append(self.critic.feature_extractor_extra)
-                    if hasattr(self.critic, 'critic_head_mlp'):
-                        head_components.append(self.critic.critic_head_mlp)
+                #     head_components = []
+                #     if hasattr(self.critic, 'feature_extractor_extra'):
+                #         head_components.append(self.critic.feature_extractor_extra)
+                #     if hasattr(self.critic, 'critic_head_mlp'):
+                #         head_components.append(self.critic.critic_head_mlp)
                     
-                    critic_head_trainable = any(any(p.requires_grad for p in comp.parameters()) 
-                                               for comp in head_components if comp is not None)
+                #     critic_head_trainable = any(any(p.requires_grad for p in comp.parameters()) 
+                #                                for comp in head_components if comp is not None)
                     
-                    # 获取当前学习率
-                    lr_actor, lr_critic_fe, lr_critic_head = "N/A", "N/A", "N/A"
-                    for pg in self.algorithm.optimizer.param_groups:
-                        if pg.get('name') == 'actor': lr_actor = f"{pg['lr']:.2e}"
-                        if pg.get('name') == 'critic_feature_extractor': lr_critic_fe = f"{pg['lr']:.2e}"
-                        if pg.get('name') == 'critic_head': lr_critic_head = f"{pg['lr']:.2e}"
+                #     # 获取当前学习率
+                #     lr_actor, lr_critic_fe, lr_critic_head = "N/A", "N/A", "N/A"
+                #     for pg in self.algorithm.optimizer.param_groups:
+                #         if pg.get('name') == 'actor': lr_actor = f"{pg['lr']:.2e}"
+                #         if pg.get('name') == 'critic_feature_extractor': lr_critic_fe = f"{pg['lr']:.2e}"
+                #         if pg.get('name') == 'critic_head': lr_critic_head = f"{pg['lr']:.2e}"
                     
-                    self.logger.info(f"Iter {iterations} - 组件状态: Actor {'训练中' if actor_trainable else '冻结'} (LR={lr_actor}), "
-                                    f"CriticFE {'训练中' if critic_fe_trainable else '冻结'} (LR={lr_critic_fe}), "
-                                    f"CriticHead {'训练中' if critic_head_trainable else '冻结'} (LR={lr_critic_head})")
+                #     self.logger.info(f"Iter {iterations} - 组件状态: Actor {'训练中' if actor_trainable else '冻结'} (LR={lr_actor}), "
+                #                     f"CriticFE {'训练中' if critic_fe_trainable else '冻结'} (LR={lr_critic_fe}), "
+                #                     f"CriticHead {'训练中' if critic_head_trainable else '冻结'} (LR={lr_critic_head})")
 
                 # --- 7.1. 采样和数据准备 ---
                 self.logger.debug(f"Iter {iterations}: Attempting to sample from Replay Buffer.")
@@ -402,7 +362,7 @@ class Learner(Process):
                 # --- 7.3. 日志记录和 TensorBoard ---
                 steps_processed_since_log += self.config['batch_size']
                 current_time = time.time()
-                log_interval = self.config.get('log_interval_learner', 100)
+                log_interval = self.config.get('log_interval', 100)
 
                 if iterations % log_interval == 0: 
                     time_since_log = current_time - cur_time_log if cur_time_log and iterations > 0 else (current_time - start_iter_time if iterations == 0 else 1.0)
@@ -481,11 +441,12 @@ class Learner(Process):
 
                     cur_time_log = current_time
                     steps_processed_since_log = 0
-                  # --- 7.4 更新 InferenceServer 中的模型 ---
+
+                # --- 7.4 更新 InferenceServer 中的模型 ---
                 update_eval_model_interval = self.config.get('model_push_interval', 10)
                 
                 if iterations > 0 and iterations % update_eval_model_interval == 0: 
-                    self.logger.info(f"Iter {iterations}: Attempting to send updated model state to InferenceServer for its eval_model.")
+                    self.logger.debug(f"Iter {iterations}: Attempting to send updated model state to InferenceServer for its eval_model.")
                     try:
                         # 发送 actor 状态
                         actor_state_cpu = {k: v.cpu() for k, v in self.actor.state_dict().items()}
@@ -499,7 +460,7 @@ class Learner(Process):
                             try:
                                 self.inference_server_cmd_queue.put(("UPDATE_ACTOR_MODEL", actor_state_cpu), 
                                                                   timeout=queue_put_timeout)
-                                self.logger.info(f"Iter {iterations}: Command 'UPDATE_ACTOR_MODEL' sent to InferenceServer.")
+                                self.logger.debug(f"Iter {iterations}: Command 'UPDATE_ACTOR_MODEL' sent to InferenceServer.")
                             except Exception as e_put_actor:
                                 self.logger.error(f"Iter {iterations}: Failed to send 'UPDATE_ACTOR_MODEL' command: {e_put_actor}. "
                                                  f"Queue might be full or InferenceServer unresponsive.")
@@ -508,7 +469,7 @@ class Learner(Process):
                             try:
                                 self.inference_server_cmd_queue.put(("UPDATE_CRITIC_MODEL", critic_state_cpu),
                                                                   timeout=queue_put_timeout)
-                                self.logger.info(f"Iter {iterations}: Command 'UPDATE_CRITIC_MODEL' sent to InferenceServer.")
+                                self.logger.debug(f"Iter {iterations}: Command 'UPDATE_CRITIC_MODEL' sent to InferenceServer.")
                             except Exception as e_put_critic:
                                 self.logger.error(f"Iter {iterations}: Failed to send 'UPDATE_CRITIC_MODEL' command: {e_put_critic}. "
                                                  f"Queue might be full or InferenceServer unresponsive.")
