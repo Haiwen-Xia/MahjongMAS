@@ -292,7 +292,12 @@ class PPOAlgorithm:
             
             # 提取global_obs用于critic (增强版检查)
             global_obs = None
-            
+            adv_norm_flag = self.config.get("normalize_adv",True)
+            if adv_norm_flag:
+                
+                advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+            else:
+                self.logger.warning("Advantages normalization is disabled.")
             # 策略1：首先尝试使用'global_obs'
             if 'global_obs' in batch['state'] and batch['state']['global_obs'] is not None:
                 try:

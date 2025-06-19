@@ -6,7 +6,7 @@ import torch
 from torch.nn import functional as F # 导入 PyTorch 函数库，通常用于损失函数、激活函数等
 import os
 # import logging # logging is handled by setup_process_logging_and_tensorboard
-from torch.utils.tensorboard import SummaryWriter # 引入 TensorBoard
+from torch.utils.tensorboard.writer import SummaryWriter # 引入 TensorBoard
 import json # 用于打印配置
 
 from utils import calculate_scheduled_lr # 导入动态学习率计算函数
@@ -137,17 +137,49 @@ class Learner(Process):
 
 
         # --- 1. 初始化日志和 TensorBoard ---
-        log_base_dir = self.config.get('log_base_dir', './logs') 
-        experiment_name = self.config.get('experiment_name', 'default_run')
-        self.logger, self.writer = setup_process_logging_and_tensorboard(
-            log_base_dir, experiment_name, self.name
+        # 根据配置决定使用主要日志还是详细日志
+        log_type = 'main'  # learner使用主要日志，记录训练信息
+        
+        self.logger, self.writer, learner_log_paths = setup_process_logging_and_tensorboard(
+            self.config['log_base_dir'], self.config, self.name, log_type=log_type
         )
+        
+        # 为详细指标创建additional writer（用于ReplayBuffer和Performance指标）
+        try:
+            self.detailed_logger, self.detailed_writer, _ = setup_process_logging_and_tensorboard(
+                self.config['log_base_dir'], self.config, self.name, log_type='detailed'
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to setup detailed logging for Learner: {e}. ReplayBuffer and Performance metrics will not be logged.")
+            self.detailed_writer = None
+        
         if not self.logger:
             print(f"CRITICAL: Logger for {self.name} could not be initialized. Exiting.")
             if self.writer: self.writer.close()
+            if hasattr(self, 'detailed_writer') and self.detailed_writer: self.detailed_writer.close()
             return
         self.logger.info(f"Learner process {self.name} started. PID: {os.getpid()}.")
         
+        # 检查TensorBoard writer状态
+        if self.writer:
+            self.logger.info(f"✅ Main TensorBoard writer创建成功: {learner_log_paths.get('tensorboard_path', 'Unknown path')}")
+        else:
+            self.logger.warning(f"❌ Main TensorBoard writer创建失败!")
+            
+        if hasattr(self, 'detailed_writer') and self.detailed_writer:
+            self.logger.info(f"✅ Detailed TensorBoard writer创建成功")
+        else:
+            self.logger.warning(f"❌ Detailed TensorBoard writer创建失败或不存在")
+            
+        # 立即写入一个测试指标以验证TensorBoard工作
+        if self.writer:
+            try:
+                self.writer.add_scalar('Test/Learner_Initialization', 1.0, 0)
+                self.writer.flush()
+                self.logger.info("✅ 成功写入测试TensorBoard指标")
+            except Exception as e:
+                self.logger.error(f"❌ 测试TensorBoard写入失败: {e}")
+
         # --- 修改部分：更安全地记录配置信息 ---
         config_to_log = {}
         known_unserializable_keys = ['shutdown_event', 'inference_server_cmd_queue'] # 以及其他可能的队列或事件对象
@@ -430,27 +462,31 @@ class Learner(Process):
                     entropy_loss_epoch_avg = train_metrics.get('entropy_loss', 0.0)
                     total_loss_epoch_avg = train_metrics.get('total_loss', 0.0)
                     
+                    # 简化的控制台日志，移除缓冲区和性能信息
                     log_msg = (
                         f"Iter: {iterations} | {lr_log_str} | "
                         f"Loss(Actual): {total_loss_epoch_avg:.4f} " 
-                        f"(P_contrib: {policy_loss_epoch_avg:.4f}, C_contrib: {critic_loss_epoch_avg:.4f}, E_contrib: {entropy_loss_epoch_avg:.4f}) | "
-                        f"Buffer: {buffer_size} (QueueEp: {buffer_stats_dict.get('queue_size',0)}, In/s: {sample_in_rate:.1f}, Out/s: {sample_out_rate:.1f}) | "
-                        f"IPS: {iterations_per_sec:.2f} | SPS: {samples_per_sec:.1f}"
+                        f"(P_contrib: {policy_loss_epoch_avg:.4f}, C_contrib: {critic_loss_epoch_avg:.4f}, E_contrib: {entropy_loss_epoch_avg:.4f})"
                     )
                     self.logger.info(log_msg)
+                    
+                    # 记录重要的训练里程碑到统一日志（每100次迭代或关键节点）
+                    if iterations % (log_interval * 10) == 0 or iterations in [10, 50, 100, 500, 1000]:
+                        # 主要日志只记录核心训练信息
+                        self.logger.info(f"🎯 TRAINING_MILESTONE | Iter: {iterations} | "
+                                        f"TotalLoss: {total_loss_epoch_avg:.4f} | "
+                                        f"PolicyLoss: {policy_loss_epoch_avg:.4f} | "
+                                        f"CriticLoss: {critic_loss_epoch_avg:.4f} | "
+                                        f"LearningRates: A={log_lr_actor} CFE={log_lr_critic_fe} CH={log_lr_critic_head}")
 
                     if self.writer:
+                        # 主TensorBoard只记录核心训练指标
                         self.writer.add_scalar('Loss/Total_Actual_Backward', total_loss_epoch_avg, iterations)
                         self.writer.add_scalar('Loss/Policy_Calculated', policy_loss_epoch_avg, iterations)
                         self.writer.add_scalar('Loss/Critic_Calculated', critic_loss_epoch_avg, iterations) 
-                        self.writer.add_scalar('Loss/Entropy_Calculated', entropy_loss_epoch_avg, iterations)
-                        self.writer.add_scalar('ReplayBuffer/SizeTimesteps', buffer_size, iterations)
-                        self.writer.add_scalar('ReplayBuffer/RateIn', sample_in_rate, iterations)
-                        self.writer.add_scalar('ReplayBuffer/RateOut', sample_out_rate, iterations)
-                        self.writer.add_scalar('ReplayBuffer/QueueSizeEpisodes', buffer_stats_dict.get('queue_size',0), iterations)
-                        self.writer.add_scalar('Performance/IterationsPerSecond_Learner', iterations_per_sec, iterations)
-                        self.writer.add_scalar('Performance/SamplesPerSecond_Learner', samples_per_sec, iterations)
-                          # 记录各组件的学习率（仅当组件可训练时）
+                        self.writer.add_scalar('Loss/Entropy_Calculated', -entropy_loss_epoch_avg, iterations)
+                        
+                        # 学习率记录保留在主TensorBoard中，因为这是核心训练指标
                         for pg in self.algorithm.optimizer.param_groups:
                             group_name = pg.get('name', 'UnnamedGroup')
                             component_name_map = {
@@ -478,7 +514,17 @@ class Learner(Process):
                                 if is_trainable_now:
                                     self.writer.add_scalar(f'LearningRate/{tb_component_name}', pg['lr'], iterations)
                         self.writer.flush()
-
+                        
+                        # 所有ReplayBuffer和Performance指标都移到详细日志的TensorBoard中
+                        if hasattr(self, 'detailed_writer') and self.detailed_writer:
+                            self.detailed_writer.add_scalar('ReplayBuffer/SizeTimesteps', buffer_size, iterations)
+                            self.detailed_writer.add_scalar('ReplayBuffer/RateIn', sample_in_rate, iterations)
+                            self.detailed_writer.add_scalar('ReplayBuffer/RateOut', sample_out_rate, iterations)
+                            self.detailed_writer.add_scalar('ReplayBuffer/QueueSizeEpisodes', buffer_stats_dict.get('queue_size',0), iterations)
+                            self.detailed_writer.add_scalar('Performance/IterationsPerSecond_Learner', iterations_per_sec, iterations)
+                            self.detailed_writer.add_scalar('Performance/SamplesPerSecond_Learner', samples_per_sec, iterations)
+                            self.detailed_writer.add_scalar('Performance/BufferAndQueue', buffer_size + buffer_stats_dict.get('queue_size',0), iterations)
+                            self.detailed_writer.flush()
                     cur_time_log = current_time
                     steps_processed_since_log = 0
                   # --- 7.4 更新 InferenceServer 中的模型 ---
@@ -521,8 +567,7 @@ class Learner(Process):
                 # --- 7.5. 保存检查点 ---
                 t_now_ckpt = time.time()
                 ckpt_interval_sec = self.config.get('ckpt_save_interval_seconds', 600)
-                default_ckpt_path = os.path.join(log_base_dir, experiment_name, 'checkpoints', self.name)
-                ckpt_dir = self.config.get('ckpt_save_path', default_ckpt_path)
+                ckpt_dir = learner_log_paths.get('checkpoint_dir', 'log/model')  # 使用新的路径
 
                 if iterations > 0 and t_now_ckpt - cur_time_ckpt > ckpt_interval_sec : 
                     os.makedirs(ckpt_dir, exist_ok=True)
@@ -576,6 +621,11 @@ class Learner(Process):
                 if self.writer:
                     try: self.writer.close()
                     except Exception as e_final_writer: self.logger.error(f"Error during final TensorBoard writer close: {e_final_writer}", exc_info=True)
+                
+                # 关闭详细日志的writer
+                if hasattr(self, 'detailed_writer') and self.detailed_writer:
+                    try: self.detailed_writer.close()
+                    except Exception as e_final_detailed_writer: self.logger.error(f"Error during final detailed TensorBoard writer close: {e_final_detailed_writer}", exc_info=True)
             
             # 无论如何都要清理共享内存和CUDA资源，防止内存泄漏
             self.logger.info("最终清理所有共享内存和CUDA资源...")
